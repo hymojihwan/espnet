@@ -8,10 +8,13 @@ import logging
 import sys
 from pathlib import Path
 from typing import List, Optional, TextIO, Union
+import matplotlib.pyplot as plt
 
 import numpy as np
 import soundfile
 import torch
+import torchaudio
+import torchaudio.functional as F
 
 # imports for CTC segmentation
 from ctc_segmentation import (
@@ -426,7 +429,19 @@ class CTCSegmentation:
         lpz = self.ctc.log_softmax(enc).detach()
         #  Shape should be ( <time steps>, <classes> )
         lpz = lpz.squeeze(0).cpu().numpy()
+
         return lpz
+
+    def plot_alignment(self, lpz, target_text, text):
+        fig, ax = plt.subplots(figsize=(12,6))
+        target = [i for i in target_text[0]]
+        filtered_lpz = lpz[:, target]
+        ax.imshow(filtered_lpz.T)
+        ax.set_title("Frame-wise class probabilities")
+        ax.set_xlabel("Time")
+        ax.set_ylabel("Labels")
+        fig.savefig("test/alignment_plot.png", dpi=300, bbox_inches='tight')
+        plt.close(fig)
 
     def _split_text(self, text):
         """Convert text to list and extract utterance IDs."""
@@ -519,6 +534,7 @@ class CTCSegmentation:
             ]
             token_list = [utt.replace("<unk>", "") for utt in token_list]
             ground_truth_mat, utt_begin_indices = prepare_text(config, token_list)
+        
         task = CTCSegmentationTask(
             config=config,
             name=name,
@@ -528,7 +544,7 @@ class CTCSegmentation:
             utt_ids=utt_ids,
             lpz=lpz,
         )
-        return task
+        return task, token_list
 
     @staticmethod
     @typechecked
@@ -567,6 +583,23 @@ class CTCSegmentation:
             "done": True,
         }
         return result
+    
+    def forced_align(self, lpz, tokens):
+        targets = torch.tensor(tokens, dtype=torch.int32)
+        
+        if targets.numel() == 0:
+            raise ValueError(f"Targets tensor is empty for text: {targets}")
+
+        # Ensure targets are valid before calling forced_align
+        if torch.max(targets) >= lpz.shape[-1]:
+            raise ValueError(
+                f"Target tokens exceed log_probs dimensions: max(targets)={torch.max(targets)}, log_probs.shape[-1]={lpz.shape[-1]}"
+            )
+        alignments, scores = F.forced_align(lpz, targets, blank=0)
+
+        alignments, scores = alignments[0], scores[0]  # remove batch dimension for simplicity
+        scores = scores.exp()  # convert back to probability
+        return alignments, scores
 
     @typechecked
     def __call__(
@@ -575,7 +608,7 @@ class CTCSegmentation:
         text: Union[List[str], str],
         fs: Optional[int] = None,
         name: Optional[str] = None,
-    ) -> CTCSegmentationTask:
+    ):
         """Align utterances.
 
         Args:
@@ -593,11 +626,108 @@ class CTCSegmentation:
         # Get log CTC posterior probabilities
         lpz = self.get_lpz(speech)
         # Conflate text & lpz & config as a segmentation task object
-        task = self.prepare_segmentation_task(text, lpz, name, speech.shape[0])
+        task, target_text = self.prepare_segmentation_task(text, lpz, name, speech.shape[0])
+
+        # save the plot of Frame-wise class log probabilities
+        # self.plot_alignment(lpz, target_text, text)
+        
+        # extract forced-alignment
+        log_prob = torch.tensor(lpz).unsqueeze(0)
+        alignments, scores = self.forced_align(log_prob, target_text)
+        # for i, (ali, score) in enumerate(zip(alignments, scores)):
+        #     print(f"{i:3d}:\t{ali:2d} [{self.token_list[ali]}], {score:.2f}")
+
         # Apply CTC segmentation
         segments = self.get_segments(task)
         task.set(**segments)
-        return task
+        return task, alignments, scores
+
+def load_wav_and_text_lists(wav_scp, text_file):
+    # 화자명과 오디오 경로 매핑
+    wav_dict = {}
+    with open(wav_scp, 'r') as f:
+        for line in f:
+            parts = line.strip().split(maxsplit=1)  # 공백 기준 분리
+            speaker, wav_path = parts[0], parts[1]
+            wav_dict[speaker] = Path(wav_path)  # wav 경로 저장
+
+    # 화자명과 텍스트 매핑
+    text_dict = {}
+    with open(text_file, 'r') as f:
+        for line in f:
+            parts = line.strip().split(maxsplit=1)  # 공백 기준 분리
+            speaker, text = parts[0], parts[1]
+            text_dict[speaker] = text  # 텍스트 저장
+
+    # 매칭 리스트 생성
+    audio_list = []
+    text_list = []
+    speakers = []
+
+    for speaker in wav_dict:
+        if speaker in text_dict:  # 화자명 일치 여부 확인
+            audio_list.append(wav_dict[speaker])  # 오디오 경로 추가
+            text_list.append(text_dict[speaker])  # 텍스트 추가
+            speakers.append(speaker)  # 화자명 추가
+        else:
+            print(f"Warning: {speaker}에 대한 텍스트 정보가 없습니다.")
+
+    return audio_list, text_list, speakers
+
+@typechecked
+def batch_ctc_align(
+    log_level: Union[int, str],
+    asr_train_config: str,
+    asr_model_file: str,
+    wav_scp: Path,
+    text_file: Path,
+    output: TextIO,
+    print_utt_text: bool = True,
+    print_utt_score: bool = True,
+    **kwargs,
+):
+    """Provide the scripting interface to align text to audio."""
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s (%(module)s:%(lineno)d) %(levelname)s: %(message)s",
+    )
+
+    # Ignore configuration values that are set to None (from parser).
+    kwargs = {k: v for (k, v) in kwargs.items() if v is not None}
+
+    # Prepare CTC segmentation module
+    model = {
+        "asr_train_config": asr_train_config,
+        "asr_model_file": asr_model_file,
+    }
+    aligner = CTCSegmentation(**model, **kwargs)
+
+    # load audio file
+    audio_list, text_list, speakers = load_wav_and_text_lists(wav_scp, text_file)
+    
+    forced_alignments = {}
+
+    for audio, text, id in zip(audio_list, text_list, speakers):
+        name = audio.stem
+        speech, fs = soundfile.read(str(audio))
+        # load text file
+       
+
+        # perform inference and CTC segmentation
+        segments, alignments, scores = aligner(speech=speech, text=text, fs=fs, name=name)
+        alignment_np = alignments.cpu().numpy()
+        scores_np = scores.cpu().numpy()
+        forced_alignment = np.stack([alignment_np, scores_np], axis=1)
+        forced_alignments[id] = forced_alignment
+
+        # Write to "segments" file or stdout
+        segments.print_utterance_text = print_utt_text
+        segments.print_confidence_score = print_utt_score
+        segments_str = str(segments)
+        
+    np.savez(output.name, **forced_alignments)
+    print(f"Saved forced alignments for batch at: {output.name}")
+    # output.write(segments_str)
 
 
 @typechecked
@@ -783,16 +913,14 @@ def get_parser():
         help="Include the confidence score in the segments output.",
     )
     group.add_argument(
-        "-a",
-        "--audio",
+        "--wav_scp",
         type=Path,
         required=True,
         help="Input audio file.",
     )
     group.add_argument(
-        "-t",
-        "--text",
-        type=argparse.FileType("r"),
+        "--text_file",
+        type=Path,
         required=True,
         help="Input text file."
         " Each line contains the ground truth of a single utterance."
@@ -807,6 +935,31 @@ def get_parser():
         help="Output in the form of a `segments` file."
         " If not given, output is written to stdout.",
     )
+    # group.add_argument(
+    #     "-a",
+    #     "--audio",
+    #     type=Path,
+    #     required=True,
+    #     help="Input audio file.",
+    # )
+    # group.add_argument(
+    #     "-t",
+    #     "--text",
+    #     type=argparse.FileType("r"),
+    #     required=True,
+    #     help="Input text file."
+    #     " Each line contains the ground truth of a single utterance."
+    #     " Kaldi-style text files include the name of the utterance as"
+    #     " the first word in the line.",
+    # )
+    # group.add_argument(
+    #     "-o",
+    #     "--output",
+    #     type=argparse.FileType("w"),
+    #     default="-",
+    #     help="Output in the form of a `segments` file."
+    #     " If not given, output is written to stdout.",
+    # )
     return parser
 
 
@@ -817,7 +970,8 @@ def main(cmd=None):
     args = parser.parse_args(cmd)
     kwargs = vars(args)
     kwargs.pop("config", None)
-    ctc_align(**kwargs)
+    batch_ctc_align(**kwargs)
+    # ctc_align(**kwargs)
 
 
 if __name__ == "__main__":

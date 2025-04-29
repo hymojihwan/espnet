@@ -9,8 +9,8 @@ train_set="train_clean_100"
 valid_set="dev"
 test_sets="test_clean test_other"
 
-asr_task="asr_transducer"
-asr_config=conf/tuning/transducer/conformer-rnnt-streaming.yaml
+asr_task="asr_mmuot_transducer"
+asr_config=conf/tuning/transducer/OT/conformer-rnnt-mmuot.yaml
 inference_config=conf/tuning/transducer/decode_transducer.yaml
 inference_asr_model=valid.loss.ave_10best.pth
 

@@ -41,6 +41,9 @@ def load_kaldi(input):
 
 DATA_TYPES = {
     "sound": lambda x: soundfile.read(x)[0],
+    "alignment": lambda x: {
+    key: [int(item[0]) for item in value] for key, value in np.load(x, allow_pickle=True).items()
+    },
     "multi_columns_sound": lambda x: np.concatenate(
         [soundfile.read(xx, always_2d=True)[0] for xx in x.split()], axis=1
     ),
@@ -157,14 +160,34 @@ class IterableESPnetDataset(IterableDataset):
             else:
                 uid_iter = self.key_file
         elif len(self.path_name_type_list) != 0:
-            uid_iter = (
-                line.rstrip().split(maxsplit=1)[0]
-                for line in open(self.path_name_type_list[0][0], encoding="utf-8")
-            )
+            if self.path_name_type_list[0][2] == "alignment":
+                alignments = {
+                    key: [int(item[0]) for item in value]
+                    for key, value in np.load(
+                        self.path_name_type_list[0][0], allow_pickle=True
+                    ).items()
+                }
+                uid_iter = iter(alignments.keys())
+            else:
+                uid_iter = (
+                    line.rstrip().split(maxsplit=1)[0]
+                    for line in open(self.path_name_type_list[0][0], encoding="utf-8")
+                )
         else:
             uid_iter = iter(self.non_iterable_dataset)
 
-        files = [open(lis[0], encoding="utf-8") for lis in self.path_name_type_list]
+        files = []
+        alignment_data = None
+        for lis in self.path_name_type_list:
+            if lis[2] == "alignment":
+                alignment_data = {
+                    key: {
+                        "alignments": [int(item[0]) for item in value],
+                    }
+                    for key, value in np.load(lis[0], allow_pickle=True).items()
+                }
+            else:
+                files.append(open(lis[0], encoding="utf-8"))
 
         worker_info = torch.utils.data.get_worker_info()
 
@@ -176,75 +199,83 @@ class IterableESPnetDataset(IterableDataset):
             if worker_info is not None:
                 if (count - 1) % worker_info.num_workers != worker_info.id:
                     continue
+                
+            data = {}
+
+            # 1. Handle alignment files
+            if alignment_data is not None and uid in alignment_data:
+                data["alignment"] = alignment_data[uid]
+
 
             # 1. Read a line from each file
-            while True:
-                keys = []
-                values = []
-                for f in files:
-                    linenum += 1
-                    try:
-                        line = next(f)
-                    except StopIteration:
-                        raise RuntimeError(f"{uid} is not found in the files")
-                    sps = line.rstrip().split(maxsplit=1)
-                    if len(sps) != 2:
+            if files:
+                while True:
+                    keys = []
+                    values = []
+                    for f in files:
+                        linenum += 1
+                        try:
+                            line = next(f)
+                        except StopIteration:
+                            raise RuntimeError(f"{uid} is not found in the files")
+                        sps = line.rstrip().split(maxsplit=1)
+                        if len(sps) != 2:
+                            raise RuntimeError(
+                                f"This line doesn't include a space:"
+                                f" {f}:L{linenum}: {line})"
+                            )
+                        key, value = sps
+                        keys.append(key)
+                        values.append(value)
+
+                    for k_idx, k in enumerate(keys):
+                        if k != keys[0]:
+                            raise RuntimeError(
+                                f"Keys are mismatched. Text files (idx={k_idx}) is "
+                                f"not sorted or not having same keys at L{linenum}"
+                            )
+
+                    # If the key is matched, break the loop
+                    if len(keys) == 0 or keys[0] == uid:
+                        break
+
+
+                # 2.a. Load data streamingly
+                for value, (path, name, _type) in zip(values, self.path_name_type_list):
+                    if _type != "alignment":
+                        func = DATA_TYPES[_type]
+                        array = func(value)
+                        data[name] = array
+
+                if self.non_iterable_dataset is not None:
+                    # 2.b. Load data from non-iterable dataset
+                    _, from_non_iterable = self.non_iterable_dataset[uid]
+                    data.update(from_non_iterable)
+
+                # 3. [Option] Apply preprocessing
+                #   e.g. espnet2.train.preprocessor:CommonPreprocessor
+                if self.preprocess is not None:
+                    data = self.preprocess(self.preprocess_prefix + uid, data)
+
+                # 4. Force data-precision
+                for name in data:
+                    value = data[name]
+                    if not isinstance(value, np.ndarray):
                         raise RuntimeError(
-                            f"This line doesn't include a space:"
-                            f" {f}:L{linenum}: {line})"
-                        )
-                    key, value = sps
-                    keys.append(key)
-                    values.append(value)
-
-                for k_idx, k in enumerate(keys):
-                    if k != keys[0]:
-                        raise RuntimeError(
-                            f"Keys are mismatched. Text files (idx={k_idx}) is "
-                            f"not sorted or not having same keys at L{linenum}"
+                            f"All values must be converted to np.ndarray object "
+                            f'by preprocessing, but "{name}" is still {type(value)}.'
                         )
 
-                # If the key is matched, break the loop
-                if len(keys) == 0 or keys[0] == uid:
-                    break
+                    # Cast to desired type
+                    if value.dtype.kind == "f":
+                        value = value.astype(self.float_dtype)
+                    elif value.dtype.kind == "i":
+                        value = value.astype(self.int_dtype)
+                    else:
+                        raise NotImplementedError(f"Not supported dtype: {value.dtype}")
+                    data[name] = value
 
-            # 2. Load the entry from each line and create a dict
-            data = {}
-            # 2.a. Load data streamingly
-            for value, (path, name, _type) in zip(values, self.path_name_type_list):
-                func = DATA_TYPES[_type]
-                # Load entry
-                array = func(value)
-                data[name] = array
-            if self.non_iterable_dataset is not None:
-                # 2.b. Load data from non-iterable dataset
-                _, from_non_iterable = self.non_iterable_dataset[uid]
-                data.update(from_non_iterable)
-
-            # 3. [Option] Apply preprocessing
-            #   e.g. espnet2.train.preprocessor:CommonPreprocessor
-            if self.preprocess is not None:
-                data = self.preprocess(self.preprocess_prefix + uid, data)
-
-            # 4. Force data-precision
-            for name in data:
-                value = data[name]
-                if not isinstance(value, np.ndarray):
-                    raise RuntimeError(
-                        f"All values must be converted to np.ndarray object "
-                        f'by preprocessing, but "{name}" is still {type(value)}.'
-                    )
-
-                # Cast to desired type
-                if value.dtype.kind == "f":
-                    value = value.astype(self.float_dtype)
-                elif value.dtype.kind == "i":
-                    value = value.astype(self.int_dtype)
-                else:
-                    raise NotImplementedError(f"Not supported dtype: {value.dtype}")
-                data[name] = value
-
-            yield uid, data
+                yield uid, data 
 
         if count == 0:
             raise RuntimeError("No iteration")

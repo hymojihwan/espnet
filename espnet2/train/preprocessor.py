@@ -543,7 +543,7 @@ class CommonPreprocessor(AbsPreprocessor):
     def __call__(
         self, uid: str, data: Dict[str, Union[str, np.ndarray]]
     ) -> Dict[str, np.ndarray]:
-
+        
         data = self._speech_process(data)
         data = self._text_process(data)
         return data

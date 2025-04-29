@@ -23,7 +23,7 @@ encoder_conf:
       pos_wise_act_type: swish
       conv_mod_act_type: swish
       pos_enc_dropout_rate: 0.2
-      dynamic_chunk_training: False
+      dynamic_chunk_training: True
       short_chunk_threshold: 0.75
       short_chunk_size: 25
       num_left_chunks: 4

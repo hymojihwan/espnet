@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from packaging.version import parse as V
 from typeguard import typechecked
+import random
 
 from espnet2.asr.frontend.abs_frontend import AbsFrontend
 from espnet2.asr.specaug.abs_specaug import AbsSpecAug
@@ -30,7 +31,7 @@ else:
         yield
 
 
-class ESPnetASROTTransducerModel(AbsESPnetModel):
+class ESPnetASROTDTransducerModel(AbsESPnetModel):
     """ESPnet2ASRTransducerModel module definition.
 
     Args:
@@ -73,9 +74,12 @@ class ESPnetASROTTransducerModel(AbsESPnetModel):
         encoder: Encoder,
         decoder: AbsDecoder,
         joint_network: JointNetwork,
-        ot_weight: float = 0.5,
-        epsilon: float = 1.0,
-        max_iter: int = 5,
+        joint_network_ot: JointNetwork,
+        max_iter: int = 30,
+        ot_weight: float = 0.3,
+        uot_weight: float = 0.1,
+        kd_weight: float = 0.3,
+        epsilon: float = 0.1,
         transducer_weight: float = 1.0,
         use_k2_pruned_loss: bool = False,
         k2_pruned_loss_args: Dict = {},
@@ -113,7 +117,6 @@ class ESPnetASROTTransducerModel(AbsESPnetModel):
 
         self.encoder = encoder
         self.decoder = decoder
-        self.joint_network = joint_network
 
         self.criterion_transducer = None
         self.error_calculator = None
@@ -124,10 +127,14 @@ class ESPnetASROTTransducerModel(AbsESPnetModel):
         self.use_auxiliary_ctc = auxiliary_ctc_weight > 0
         self.use_auxiliary_lm_loss = auxiliary_lm_loss_weight > 0
 
-        self.ot_proj = torch.nn.Linear(encoder.output_size, vocab_size)
         self.ot_weight = ot_weight
-        self.epsilon = epsilon
+        self.uot_weight = uot_weight
+        self.kd_weight = kd_weight
         self.max_iter = max_iter
+        self.epsilon = epsilon
+        self.joint_network = joint_network
+        self.tau = 3.0
+        self.out_proj = torch.nn.Linear(encoder.output_size * 2, encoder.output_size)
 
         if use_k2_pruned_loss:
             self.am_proj = torch.nn.Linear(
@@ -178,6 +185,7 @@ class ESPnetASROTTransducerModel(AbsESPnetModel):
         speech_lengths: torch.Tensor,
         text: torch.Tensor,
         text_lengths: torch.Tensor,
+        epoch=None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
         """Forward architecture and compute loss(es).
@@ -203,8 +211,6 @@ class ESPnetASROTTransducerModel(AbsESPnetModel):
             == text_lengths.shape[0]
         ), (speech.shape, speech_lengths.shape, text.shape, text_lengths.shape)
 
-        with torch.no_grad():
-            self.training_step += 1
         batch_size = speech.shape[0]
         text = text[:, : text_lengths.max()]
 
@@ -228,34 +234,46 @@ class ESPnetASROTTransducerModel(AbsESPnetModel):
                 encoder_out, decoder_out, text, t_len, u_len, **self.k2_pruned_loss_args
             )
         else:
-            joint_out = self.joint_network(
-                encoder_out.unsqueeze(2), decoder_out.unsqueeze(1)
-            )
-            
+            # OTGuided Joint Network를 이용하여 joint representation 산출
             if self.training:
-                # 4-1. Optimal transport computation between audio encoder and prediction network outputs
                 loss_wasserstein, aligned_features = self._calc_wasserstein_loss(
                     encoder_out,
                     decoder_out
                 )
-                ot_alignment = self.ot_proj(aligned_features)
-                ot_alignment = self.joint_network.joint_activation(ot_alignment)
-                # ot_attn_weight = torch.softmax(ot_alignment, dim=-1)
-                # 4-2. Fuse alignments between transducer and OT
-                # Step 값을 이용해 Warm-up 적용
-                lambda_ot = torch.sigmoid(self.alignment_gate) * min(1.0, self.training_step / 5000)
+                encoder_out = torch.cat([encoder_out, aligned_features], dim=-1) # [B, T, 2D]
+                encoder_out = self.out_proj(encoder_out) # [B, T, D]
+                # gating mechanism 예시 코드
+                gate_network = torch.sigmoid(self.out_proj(torch.cat([encoder_out, aligned_features], dim=-1)))  # [B,T,D]
+                fused_embedding = gate_network * encoder_out + (1 - gate_network) * aligned_features
 
-                # Residual 방식으로 결합
-                joint_out = joint_out + lambda_ot * (ot_alignment - joint_out)
+            # joint network 입력으로 사용
+                joint_out = self.joint_network(fused_embedding.unsqueeze(2), decoder_out.unsqueeze(1))
+            else:
+                joint_out = self.joint_network(encoder_out.unsqueeze(2), decoder_out.unsqueeze(1))
+            loss_trans = self._calc_transducer_loss(encoder_out, joint_out, target, t_len, u_len)
 
-            loss_trans = self._calc_transducer_loss(
-                encoder_out,
-                joint_out,
-                target,
-                t_len,
-                u_len,
-            )
-        
+        #         joint_out_ot = self._calc_attn_ot(encoder_out, decoder_out, transport_plan)
+        #         # 7. Self-distillation loss: match teacher and student soft distributions
+        # # 예를 들어, 각 배치에 대해 (T, U) 전체 logits의 평균을 계산
+        #         teacher_logits = joint_out_ot  # [B, vocab]
+        #         student_logits = joint_out   # [B, vocab]
+        #         teacher_log_prob = F.softmax(teacher_logits / self.tau, dim=-1)
+        #         student_prob = F.log_softmax(student_logits / self.tau, dim=-1)
+        #         loss_kd = F.kl_div(student_prob, teacher_log_prob, reduction='batchmean') * (self.tau ** 2)
+        #         # 8. 최종 loss: RNNT loss와 self-distillation loss 결합
+        #         loss_t = loss_trans + self.kd_weight * loss_kd  # loss_ot는 OT alignment 보조 loss로 활용
+                # OT transport plan (alignment_target)를 계산: 학습과 validation/inference 모두에서 OT를 사용
+                # loss_wasserstein, ot_decoder_feat = self._calc_wasserstein_loss(
+                # encoder_out, decoder_out, self.epsilon, self.max_iter, self.uot_weight
+                # )
+                # joint_out_ot = self.joint_network_ot(encoder_out.unsqueeze(2), ot_decoder_feat.unsqueeze(1))
+
+                # # Distillation training
+                # s_in = F.log_softmax(joint_out, dim=-1)
+                # t_in = F.softmax(joint_out_ot, dim=-1)
+                # loss_kl = F.kl_div(s_in, t_in, reduction='batchmean')
+
+                # loss_t = loss_trans + self.ot_weight * loss_wasserstein + self.kd_weight * loss_kl
 
         # 5. Auxiliary losses
         loss_ctc, loss_lm = 0.0, 0.0
@@ -270,6 +288,7 @@ class ESPnetASROTTransducerModel(AbsESPnetModel):
 
         if self.use_auxiliary_lm_loss:
             loss_lm = self._calc_lm_loss(decoder_out, target)
+
         if self.training:
             loss = ((1 - self.ot_weight) * (
                 self.transducer_weight * loss_trans
@@ -280,7 +299,7 @@ class ESPnetASROTTransducerModel(AbsESPnetModel):
             loss = (self.transducer_weight * loss_trans
                 + self.auxiliary_ctc_weight * loss_ctc
                 + self.auxiliary_lm_loss_weight * loss_lm)
-            
+
 
         # 6. CER/WER computation.
         if not self.training and (self.report_cer or self.report_wer):
@@ -306,7 +325,7 @@ class ESPnetASROTTransducerModel(AbsESPnetModel):
             )
         else:
             cer_transducer, wer_transducer = None, None
-        
+
         stats = dict(
             loss=loss.detach(),
             loss_transducer=loss_trans.detach(),
@@ -425,26 +444,32 @@ class ESPnetASROTTransducerModel(AbsESPnetModel):
             feats, feats_lengths = speech, speech_lengths
 
         return feats, feats_lengths
-    
-    def sinkhorn_knopp(self, cost_matrix, epsilon=1.0, max_iter=3):
-        n, m = cost_matrix.shape
-        u = torch.ones(n, device=cost_matrix.device) 
-        v = torch.ones(m, device=cost_matrix.device) 
 
-        K = torch.exp(-cost_matrix / epsilon)
 
-        prev_u, prev_v = None, None
-        for _ in range(max_iter):
-            prev_u, prev_v = u.clone(), v.clone()
-            u = 1.0 / (torch.matmul(K, v) + 1e-9)
-            v = 1.0 / (torch.matmul(K.T, u) + 1e-9)
+    def compute_monotonic_mask(self, T: int, U: int, delta: float = 5.0, device=None):
+        """
+        Monotonicity를 위한 mask를 계산합니다.
+        각 encoder timestep t에 대해, 이상적인 decoder index는
+            center = t * (U - 1) / (T - 1)
+        라고 할 때, |u - center| > delta인 위치에는 큰 cost (예: 1e9)를 부여합니다.
+        
+        Args:
+            T: encoder timestep 수
+            U: decoder timestep 수
+            delta: 허용 margin (유연성)
+            device: 반환 tensor가 위치할 device (예: cost_matrix.device)
             
-            # 변화량이 작으면 조기 종료
-            if torch.norm(u - prev_u) < 1e-4 and torch.norm(v - prev_v) < 1e-4:
-                break
+        Returns:
+            mask: [T, U] tensor, 허용되지 않는 위치는 큰 값, 허용된 위치는 0.
+        """
+        t_idx = torch.arange(T, device=device).unsqueeze(1).float()  # [T, 1]
+        u_idx = torch.arange(U, device=device).unsqueeze(0).float()    # [1, U]
+        center = t_idx * (U - 1) / (T - 1)  # [T, 1]
+        mask = (torch.abs(u_idx - center) > delta).float() * 1e9
+        return mask  # [T, U]
 
-        transport_plan = torch.matmul(torch.diag(u), torch.matmul(K, torch.diag(v)))
-        return transport_plan
+    def compute_euclidean_cost_matrix(self, audio_features, text_features):
+        return torch.cdist(audio_features, text_features, p=2)
     
     def compute_cosine_cost_matrix(self, audio_features, text_features):
         audio_norm = F.normalize(audio_features, p=2, dim=-1)
@@ -454,39 +479,88 @@ class ESPnetASROTTransducerModel(AbsESPnetModel):
         cost_matrix = 1 - cosine_similarity
         return cost_matrix
     
-    def _calc_wasserstein_loss(self, audio_features, text_features, epsilon=1.0, max_iter=3):
+    def sinkhorn_knopp(self, cost_matrix, epsilon=1.0, max_iter=3):
+        n, m = cost_matrix.shape
+        u = torch.ones(n, device=cost_matrix.device) 
+        v = torch.ones(m, device=cost_matrix.device) 
+
+        K = torch.exp(-cost_matrix / epsilon)
+        for _ in range(max_iter):
+            u = 1.0 / (torch.matmul(K, v))
+            v = 1.0 / (torch.matmul(K.T, u))
+
+        transport_plan = torch.matmul(torch.diag(u), torch.matmul(K, torch.diag(v)))
+
+        return transport_plan
+        
+    def _calc_wasserstein_loss(self, audio_features, text_features, epsilon=1.0, max_iter=3, uot_weight=0.1):
         batch_size, audio_len, feature_dim = audio_features.size()
         _, text_len, _ = text_features.size()
         
         total_wasserstein_loss = 0.0
+        # total_transport_plan = []
         aligned_features = []
 
+
         for i in range(batch_size):
-            # cost_matrix = torch.cdist(audio_features[i], text_features[i])  # (audio_len, text_len)
             cost_matrix = self.compute_cosine_cost_matrix(audio_features[i], text_features[i])
-            transport_plan = self.sinkhorn_knopp(cost_matrix, epsilon, max_iter)  # (audio_len, text_len)
+            transport_plan = self.sinkhorn_knopp(cost_matrix, epsilon, max_iter)  # shape: [audio_len, text_len]
+
+            T, U = cost_matrix.shape
             
-            # # Audio feature alignment (T, U, D)
-            # aligned_audio = torch.einsum('tu,td -> tud', transport_plan, audio_features[i])
-
-            # # Text feature alignment (T, U, D)
-            # aligned_text = torch.einsum('tu,ud -> tud', transport_plan, text_features[i])
-            # aligned_feature = torch.cat([aligned_audio, aligned_text], dim=-1)  # (T, U, 2D)
-
-            # aligned_features.append(aligned_feature)  # 위치 정보 제거
-            # 정렬된 오디오 특징 계산
-            aligned_feature = torch.einsum('tu,td, ud -> tud', transport_plan, audio_features[i], text_features[i])
-            aligned_features.append(aligned_feature)  # 위치 정보 제거
+            # target marginals: 각 row, column의 합이 1이 되도록 설정
+            mu = torch.ones(T, device=cost_matrix.device)
+            nu = torch.ones(U, device=cost_matrix.device)
             
             # Wasserstein 손실 계산 with Entropy regularization
             entropy_term = torch.sum(transport_plan * torch.log(transport_plan + 1e-9))
             wasserstein_loss = torch.sum(transport_plan * cost_matrix) - (epsilon * entropy_term)
-            total_wasserstein_loss += wasserstein_loss
+
+            # KL divergence penalties for Unbalanced OT cost
+            row_sum = torch.sum(transport_plan, dim=1)
+            col_sum = torch.sum(transport_plan, dim=0)
+            kl_row = torch.sum(row_sum * (torch.log(row_sum / mu) - 1) + mu)
+            kl_col = torch.sum(col_sum * (torch.log(col_sum / nu) - 1) + nu)
+
+            total_wasserstein_loss += (wasserstein_loss + (uot_weight * (kl_row + kl_col)))
+            # total_transport_plan.append(transport_plan)
+            aligned_feature = transport_plan @ text_features[i] # [T, D]
+            aligned_features.append(aligned_feature)
 
         total_wasserstein_loss /= batch_size
-        aligned_features = torch.stack(aligned_features, dim=0)  # (batch_size, audio_len, text_len, feature_dim)
+        # total_transport_plan = torch.stack(total_transport_plan, dim=0)  # (batch_size, audio_len, text_len)
+        aligned_features = torch.stack(aligned_features, dim=0)
 
         return total_wasserstein_loss, aligned_features
+
+    def _calc_attn_ot(
+        self,
+        encoder_out,
+        decoder_out,
+        transport_plan
+    ):
+       
+        # 2. 두 모달리티를 각 (t, u) 쌍에 대해 결합하기 위해 차원 확장
+        # encoder: [B, T, d_joint] → [B, T, 1, d_joint]
+        enc_exp = encoder_out.unsqueeze(2)
+        # decoder: [B, U, d_joint] → [B, 1, U, d_joint]
+        dec_exp = decoder_out.unsqueeze(1)
+        
+        # 3. transport_plan은 현재 [B, T, U]. 이를 decoder 차원에 적용하기 위해
+        # transport_plan: [B, T, U] → [B, T, U, 1]
+        trans_exp = transport_plan.unsqueeze(-1)
+        
+        # 4. OT를 attention weight처럼 사용: 각 (t,u) 쌍에서 decoder 정보에 transport_plan weighting 적용
+        # dec_att: [B, T, U, d_joint]
+        dec_att = trans_exp * dec_exp
+        
+        # 5. Encoder 정보는 encoder feature (broadcast along u dimension)와 결합
+        # enc_exp: [B, T, 1, d_joint] broadcast → [B, T, U, d_joint]
+        joint_input = torch.tanh(enc_exp + dec_att)  # [B, T, U, d_joint]
+        
+        # 6. 최종 joint representation을 vocabulary 차원으로 매핑
+        logits = self.out_proj(joint_input)  # [B, T, U, vocab_size]
+        return logits
 
     def _calc_transducer_loss(
         self,

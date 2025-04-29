@@ -1,14 +1,16 @@
 # general
 batch_type: numel
-batch_bins: 4000000
-accum_grad: 18
+batch_bins: 2200000
+accum_grad: 32
 max_epoch: 100 # 100 produces better results.
 patience: none
 init: none
 num_att_plot: 0
-ot_weight: 0.5
-epsilon: 1.0
-max_iter: 3
+student_checkpoint: null
+# student_checkpoint: /home/user/Workspace/espnet/egs2/librispeech_100/asr1/exp/asr_train_asr_conformer-rnnt-nonstreaming-kd_raw_en_bpe2048_sp/checkpoint.pth
+teacher_path: /home/user/Workspace/espnet/egs2/librispeech_100/asr1/exp/asr_conformer-rnnt_raw_en_bpe2048_sp/valid.loss.ave_10best.pth
+kd_weight: 0.3
+temp_tau: 1.0
 
 unused_parameters: true    # set as true if some params are unused in DDP
 
@@ -23,7 +25,7 @@ encoder_conf:
       pos_wise_act_type: swish
       conv_mod_act_type: swish
       pos_enc_dropout_rate: 0.2
-      dynamic_chunk_training: False
+      dynamic_chunk_training: True
       short_chunk_threshold: 0.75
       short_chunk_size: 25
       num_left_chunks: 4

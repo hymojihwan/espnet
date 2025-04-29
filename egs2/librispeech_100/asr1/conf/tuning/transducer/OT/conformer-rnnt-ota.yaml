@@ -1,16 +1,15 @@
 # general
 batch_type: numel
-batch_bins: 4000000
+batch_bins: 4400000
 accum_grad: 18
 max_epoch: 100 # 100 produces better results.
 patience: none
 init: none
 num_att_plot: 0
 ot_weight: 0.5
+uot_weight: 0.3
 epsilon: 1.0
-max_iter: 3
-
-unused_parameters: true    # set as true if some params are unused in DDP
+max_iter: 5
 
 model_conf:
     transducer_weight: 1.0

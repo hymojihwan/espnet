@@ -77,7 +77,72 @@ def soundfile_read(
     else:
         return array, rate
 
+class ForcedAlignmentReader(collections.abc.Mapping):
+    """Reader class for 'forced_alignment.npz'.
 
+    Examples:
+        forced_alignment.npz is a numpy file that contains:
+        {
+            "key1": [alignment_array1, scores1],
+            "key2": [alignment_array2, scores2],
+            ...
+        }
+
+        >>> reader = ForcedAlignmentReader('forced_alignment.npz')
+        >>> alignment, scores = reader['key1']
+    """
+
+    @typechecked
+    def __init__(self, fname: str):
+        self.fname = fname
+        # Load the npz file into memory
+        self.data = np.load(fname, allow_pickle=True)
+
+    def __getitem__(self, key) -> Tuple[np.ndarray, np.ndarray]:
+        """Retrieve alignment and scores for a given key."""
+        if key not in self.data:
+            raise KeyError(f"Key {key} not found in {self.fname}")
+        
+        alignments = [int(item[0]) for item in self.data[key]]
+        scores = [item[1] for item in self.data[key]]
+
+        
+        return alignments, scores
+
+    def get_alignment(self, key) -> np.ndarray:
+        """Retrieve only the alignment array for a given key."""
+        if key not in self.data:
+            raise KeyError(f"Key {key} not found in {self.fname}")
+        
+        # Extract only the alignments
+        alignments = [item[0] for item in self.data[key]]
+        return alignments
+
+    def get_scores(self, key) -> List[float]:
+        """Retrieve only the scores array for a given key."""
+        if key not in self.data:
+            raise KeyError(f"Key {key} not found in {self.fname}")
+        
+        # Extract only the scores
+        scores = [item[1] for item in self.data[key]]
+        return scores
+
+    def __contains__(self, key: str) -> bool:
+        """Check if the key exists in the data."""
+        return key in self.data
+
+    def __len__(self) -> int:
+        """Return the number of keys in the data."""
+        return len(self.data)
+
+    def __iter__(self):
+        """Iterate over the keys in the data."""
+        return iter(self.data)
+
+    def keys(self):
+        """Retrieve all keys in the data."""
+        return self.data.keys()
+    
 class SoundScpReader(collections.abc.Mapping):
     """Reader class for 'wav.scp'.
 

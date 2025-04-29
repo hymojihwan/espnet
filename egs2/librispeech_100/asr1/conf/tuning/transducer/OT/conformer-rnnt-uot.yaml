@@ -7,8 +7,9 @@ patience: none
 init: none
 num_att_plot: 0
 ot_weight: 0.5
-epsilon: 1.0
-max_iter: 3
+uot_weight: 0.3
+epsilon: 0.05
+max_iter: 30
 
 unused_parameters: true    # set as true if some params are unused in DDP
 

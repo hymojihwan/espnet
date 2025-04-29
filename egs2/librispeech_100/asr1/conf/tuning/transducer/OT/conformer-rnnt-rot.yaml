@@ -6,9 +6,9 @@ max_epoch: 100 # 100 produces better results.
 patience: none
 init: none
 num_att_plot: 0
+window_size: 10
 ot_weight: 0.5
-epsilon: 1.0
-max_iter: 3
+prob_alignment_masking: 0.2
 
 unused_parameters: true    # set as true if some params are unused in DDP
 

@@ -42,7 +42,7 @@ from espnet2.fileio.read_text import (
 )
 from espnet2.fileio.rttm import RttmReader
 from espnet2.fileio.score_scp import SingingScoreReader
-from espnet2.fileio.sound_scp import SoundScpReader
+from espnet2.fileio.sound_scp import SoundScpReader, ForcedAlignmentReader
 from espnet2.utils.sized_dict import SizedDict
 
 
@@ -254,6 +254,11 @@ DATA_TYPES = {
         "   utterance_id_b b.wav\n"
         "   ...",
     ),
+    "alignment": dict(
+        func=lambda path: ForcedAlignmentReader(path),
+        kwargs=[],
+        help="Loader for forced alignment .npz files."
+    ),
     "multi_columns_sound": dict(
         func=multi_columns_sound_loader,
         kwargs=["float_dtype", "allow_multi_rates"],
@@ -432,7 +437,6 @@ class AbsDataset(Dataset, ABC):
     @abstractmethod
     def __getitem__(self, uid) -> Tuple[Any, Dict[str, np.ndarray]]:
         raise NotImplementedError
-
 
 class ESPnetDataset(AbsDataset):
     """Pytorch Dataset class for ESPNet.

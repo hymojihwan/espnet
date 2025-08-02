@@ -1,20 +1,16 @@
 # general
 batch_type: numel
-batch_bins: 2200000
-accum_grad: 32
+batch_bins: 8000000
+accum_grad: 9
 max_epoch: 101 # 100 produces better results.
 patience: none
 init: none
 num_att_plot: 0
-student_checkpoint: null
-# student_checkpoint: /home/user/Workspace/espnet/egs2/librispeech_100/asr1/exp/asr_train_asr_conformer-rnnt-nonstreaming-kd_raw_en_bpe2048_sp/checkpoint.pth
-teacher_path: /home/user/Workspace/espnet/egs2/librispeech_100/asr1/exp/asr_conformer-rnnt_raw_en_bpe2048_sp/valid.loss.ave_10best.pth
-kd_weight: 0.3
-temp_tau: 1.0
 
-unused_parameters: true    # set as true if some params are unused in DDP
+# unused_parameters: true    # set as true if some params are unused in DDP
 
 model_conf:
+    use_k2_pruned_loss: true
     transducer_weight: 1.0
     auxiliary_ctc_weight: 0.0
     report_cer: True

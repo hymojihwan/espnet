@@ -234,19 +234,10 @@ class ESPnetASROTTransducerModel(AbsESPnetModel):
             
             if self.training:
                 # 4-1. Optimal transport computation between audio encoder and prediction network outputs
-                loss_wasserstein, aligned_features = self._calc_wasserstein_loss(
+                loss_wasserstein, _ = self._calc_wasserstein_loss(
                     encoder_out,
                     decoder_out
                 )
-                ot_alignment = self.ot_proj(aligned_features)
-                ot_alignment = self.joint_network.joint_activation(ot_alignment)
-                # ot_attn_weight = torch.softmax(ot_alignment, dim=-1)
-                # 4-2. Fuse alignments between transducer and OT
-                # Step 값을 이용해 Warm-up 적용
-                lambda_ot = torch.sigmoid(self.alignment_gate) * min(1.0, self.training_step / 5000)
-
-                # Residual 방식으로 결합
-                joint_out = joint_out + lambda_ot * (ot_alignment - joint_out)
 
             loss_trans = self._calc_transducer_loss(
                 encoder_out,

@@ -19,7 +19,7 @@ from espnet2.asr_transducer.decoder.rnn_decoder import RNNDecoder
 from espnet2.asr_transducer.decoder.rwkv_decoder import RWKVDecoder
 from espnet2.asr_transducer.decoder.stateless_decoder import StatelessDecoder
 from espnet2.asr_transducer.encoder.encoder import Encoder
-from espnet2.asr_transducer.espnet_uot_attn_transducer_model import ESPnetASRUOTTransducerModel
+from espnet2.asr_transducer.espnet_uot_transducer_model import ESPnetASRUOTTransducerModel
 from espnet2.asr_transducer.joint_network import JointNetwork
 from espnet2.layers.abs_normalize import AbsNormalize
 from espnet2.layers.global_mvn import GlobalMVN

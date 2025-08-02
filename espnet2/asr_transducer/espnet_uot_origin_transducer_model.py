@@ -4,7 +4,9 @@ import logging
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple, Union
 
+import random
 import torch
+import torch.nn.functional as F
 from packaging.version import parse as V
 from typeguard import typechecked
 
@@ -17,6 +19,8 @@ from espnet2.asr_transducer.utils import get_transducer_task_io
 from espnet2.layers.abs_normalize import AbsNormalize
 from espnet2.torch_utils.device_funcs import force_gatherable
 from espnet2.train.abs_espnet_model import AbsESPnetModel
+from espnet2.asr_transducer.activation import get_activation
+
 
 if V(torch.__version__) >= V("1.6.0"):
     from torch.cuda.amp import autocast
@@ -27,7 +31,7 @@ else:
         yield
 
 
-class ESPnetASRTransducerModel(AbsESPnetModel):
+class ESPnetASRUOTTransducerModel(AbsESPnetModel):
     """ESPnet2ASRTransducerModel module definition.
 
     Args:
@@ -70,6 +74,10 @@ class ESPnetASRTransducerModel(AbsESPnetModel):
         encoder: Encoder,
         decoder: AbsDecoder,
         joint_network: JointNetwork,
+        ot_weight: float = 0.5,
+        uot_weight: float = 0.5,
+        epsilon: float = 1.0,
+        max_iter: int = 5,
         transducer_weight: float = 1.0,
         use_k2_pruned_loss: bool = False,
         k2_pruned_loss_args: Dict = {},
@@ -112,8 +120,18 @@ class ESPnetASRTransducerModel(AbsESPnetModel):
         self.criterion_transducer = None
         self.error_calculator = None
 
+        self.training_step = 0
+
         self.use_auxiliary_ctc = auxiliary_ctc_weight > 0
         self.use_auxiliary_lm_loss = auxiliary_lm_loss_weight > 0
+
+        self.ot_joint_linear = torch.nn.Linear(vocab_size, vocab_size)
+        self.ot_joint_norm = torch.nn.LayerNorm(vocab_size)
+        self.ot_proj = torch.nn.Linear(encoder.output_size, vocab_size)
+        self.ot_weight = ot_weight
+        self.uot_weight = uot_weight
+        self.epsilon = epsilon
+        self.max_iter = max_iter
 
         if use_k2_pruned_loss:
             self.am_proj = torch.nn.Linear(
@@ -193,60 +211,61 @@ class ESPnetASRTransducerModel(AbsESPnetModel):
         batch_size = speech.shape[0]
         text = text[:, : text_lengths.max()]
 
+        # 1. Encoder
+        encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
+
         # 103-1240-0006 AS AVONLEA HOUSEKEEPERS WERE WONT TO TELL IN AWED VOICES AND KEEPING A SHARP EYE ON THE MAIN ROAD THAT CROSSED THE HOLLOW AND WOUND UP THE STEEP RED HILL BEYOND
         target_utt = "103-1240-0006"
-        # 103-1240-0026 AND HERE SHE SAT NOW KNITTING AND THE TABLE BEHIND HER WAS LAID FOR SUPPER MISSUS RACHEL BEFORE SHE HAD FAIRLY CLOSED THE DOOR
-        # target_utt = "103-1240-0026"
         if target_utt not in utt_id:
             with torch.no_grad():
                 loss = torch.zeros([], device=speech.device, requires_grad=True)
                 stats = {}
                 weight = torch.ones(1, device=speech.device)
             return loss, stats, weight
-        self.eval()  
-        print("target_utt", target_utt)
         
         idx = utt_id.index(target_utt)
+        # 2. Transducer-related I/O preparation
+        decoder_in, target, t_len, u_len = get_transducer_task_io(
+            text,
+            encoder_out_lens,
+            ignore_id=self.ignore_id,
+        )
 
-        with torch.no_grad():
-            # 1. Encoder
-            encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
+        # 3. Decoder
+        self.decoder.set_device(encoder_out.device)
+        decoder_out = self.decoder(decoder_in)
 
-            # 2. Transducer-related I/O preparation
-            decoder_in, target, t_len, u_len = get_transducer_task_io(
-                text,
-                encoder_out_lens,
-                ignore_id=self.ignore_id,
+        # 4. Joint Network and RNNT loss computation
+        if self.use_k2_pruned_loss:
+            loss_trans = self._calc_k2_transducer_pruned_loss(
+                encoder_out, decoder_out, text, t_len, u_len, **self.k2_pruned_loss_args
+            )
+        else:
+            joint_out = self.joint_network(
+                encoder_out.unsqueeze(2), decoder_out.unsqueeze(1)
             )
 
-            # 3. Decoder
-            self.decoder.set_device(encoder_out.device)
-            decoder_out = self.decoder(decoder_in)
-            
+            self.extract_alignment(joint_out[idx], text[idx], t_len[idx].item(), u_len[idx].item(), target_utt)
+            exit()
 
-            # 4. Joint Network and RNNT loss computation
-            if self.use_k2_pruned_loss:
-                loss_trans, joint_out, k2_joint_out = self._calc_k2_transducer_pruned_loss(
-                    encoder_out, decoder_out, text, t_len, u_len, **self.k2_pruned_loss_args
-                )
-                # k2에서는 am + lm로 만든 joint output 사용
-                self.extract_alignment_k2(k2_joint_out[idx], text[idx], t_len[idx].item(), u_len[idx].item(), target_utt)
-                exit()
-            else:
-                joint_out = self.joint_network(
-                    encoder_out.unsqueeze(2), decoder_out.unsqueeze(1)
-                )
-
-                self.extract_alignment(joint_out[idx], text[idx], t_len[idx].item(), u_len[idx].item(), target_utt)
-                exit()
-
-                loss_trans = self._calc_transducer_loss(
+            if self.training:
+                # 4-1. Optimal transport computation between audio encoder and prediction network outputs
+                loss_wasserstein = self._calc_wasserstein_loss(
                     encoder_out,
-                    joint_out,
-                    target,
-                    t_len,
-                    u_len,
+                    decoder_out,
+                    epsilon=self.epsilon,
+                    max_iter=self.max_iter
                 )
+                ot_alignment = self.ot_proj(aligned_features)
+                ot_alignment = self.joint_network.joint_activation(ot_alignment)
+                
+            loss_trans = self._calc_transducer_loss(
+                encoder_out,
+                joint_out,
+                target,
+                t_len,
+                u_len,
+            )
 
         # 5. Auxiliary losses
         loss_ctc, loss_lm = 0.0, 0.0
@@ -262,12 +281,17 @@ class ESPnetASRTransducerModel(AbsESPnetModel):
         if self.use_auxiliary_lm_loss:
             loss_lm = self._calc_lm_loss(decoder_out, target)
 
-        loss = (
-            self.transducer_weight * loss_trans
-            + self.auxiliary_ctc_weight * loss_ctc
-            + self.auxiliary_lm_loss_weight * loss_lm
-        )
-
+        if self.training:
+            # ot_gate = torch.sigmoid(self.alignment_gate)
+            loss = (self.transducer_weight * loss_trans
+                + self.auxiliary_ctc_weight * loss_ctc
+                + self.auxiliary_lm_loss_weight * loss_lm)
+            loss = (1.0 - self.ot_weight) * loss + self.ot_weight * loss_wasserstein
+        else:
+            loss = (self.transducer_weight * loss_trans
+                + self.auxiliary_ctc_weight * loss_ctc
+                + self.auxiliary_lm_loss_weight * loss_lm)
+            
         # 6. CER/WER computation.
         if not self.training and (self.report_cer or self.report_wer):
             if self.error_calculator is None:
@@ -296,6 +320,7 @@ class ESPnetASRTransducerModel(AbsESPnetModel):
         stats = dict(
             loss=loss.detach(),
             loss_transducer=loss_trans.detach(),
+            loss_wasserstein=loss_wasserstein.detach() if self.training else None,
             loss_aux_ctc=loss_ctc.detach() if loss_ctc > 0.0 else None,
             loss_aux_lm=loss_lm.detach() if loss_lm > 0.0 else None,
             cer_transducer=cer_transducer,
@@ -306,102 +331,20 @@ class ESPnetASRTransducerModel(AbsESPnetModel):
         loss, stats, weight = force_gatherable((loss, stats, batch_size), loss.device)
 
         return loss, stats, weight
-            
-    def extract_alignment_k2(
-        self,
-        joint_sample,
-        labels,
-        T,
-        U,
-        target_utt,
-        # k2에서는 pruning된 범위를 사용하므로
-        # 원본 encoder_out_len, decoder_out_len도 필요할 수 있음
-        original_T=None,
-        original_U=None,
-    ):
-        import matplotlib.pyplot as plt
-        import torch.nn.functional as F
-        import numpy as np
-        
-        save_path = f"/home/user/Workspace/espnet/egs2/librispeech_100/asr1/exp/asr_conformer-rnnt-streaming-k2_raw_en_bpe2048_sp/k2_alignment.pdf"
 
-        print(f"DEBUG: joint_sample shape: {joint_sample.shape}")
-        print(f"DEBUG: T={T}, U={U}")
-        print(f"DEBUG: labels shape: {labels.shape}")
-        print(f"DEBUG: labels: {labels}")
-
-        # k2에서는 joint_sample이 이미 pruned된 상태
-        probs = F.softmax(joint_sample, dim=-1).cpu().detach()
-        print(f"DEBUG: probs shape: {probs.shape}")
-        
-        # k2에서는 T, U가 pruned된 크기이므로 주의
-        true_label_probs = torch.zeros(T, U)
-        for t in range(T):
-            for u in range(U):
-                if u < labels.size(0):  # bounds check
-                    true_label_index = labels[u].item()
-                    true_label_probs[t, u] = probs[t, u, true_label_index]
-        
-        print(f"DEBUG: true_label_probs shape: {true_label_probs.shape}")
-        print(f"DEBUG: true_label_probs max: {true_label_probs.max()}, min: {true_label_probs.min()}")
-        
-        path_t = true_label_probs.argmax(dim=0)
-        print(f"DEBUG: path_t: {path_t}")
-        
-        mask = torch.zeros_like(true_label_probs)
-        u_idx = torch.arange(path_t.size(0))
-        mask[path_t, u_idx] = true_label_probs[path_t, u_idx]
-
-        plt.figure(figsize=(3.5, 2.5))
-        # plt.imshow(
-        #     mask.T.detach().cpu(), 
-        #     origin="lower", aspect="auto", 
-        #     cmap="Reds", vmin=0, vmax=1
-        # )
-        # plt.imshow(true_label_probs.T, aspect='auto', origin='lower', vmin=0.0, vmax=1.0, cmap='viridis')
-        plt.imshow(
-            true_label_probs.T.detach().cpu(), 
-            origin="lower", aspect="auto", 
-            cmap="Reds", vmin=0, vmax=1, alpha=0.3
-        )
-
-        # argmax 경로를 점으로 시각화
-        mask_np = mask.detach().cpu().numpy()
-        t_coords, u_coords = np.where(mask_np > 0)  # x=t, y=u (원래 shape 기준)
-
-        # 🔴 점 크기 (s), 색상 (c), 투명도 (alpha), 경계 없음 (edgecolors='none')
-        plt.scatter(t_coords, u_coords, c='darkred', marker='s', s=12, alpha=0.9, edgecolors='none')
-
-        step = max(1, U // 5)
-        yt = np.arange(0, U, step)
-        plt.yticks(yt)
-
-        # plt.colorbar()
-        plt.xlabel('Time steps (T)')
-        plt.ylabel('Text steps index (U)')
-        plt.xticks()
-        plt.yticks()
-        # plt.title('Transducer Probability Alignment')
-        plt.tight_layout()
-
-        # plt.yticks(ticks=range(U), labels=text_labels)
-        plt.savefig(save_path, format='pdf', bbox_inches='tight', dpi=300)
-        exit()
 
     def extract_alignment(
         self,
         joint_sample,
         labels,
-        T,
-        U,
+        T_len,
+        U_len,
         target_utt,
     ):
         import matplotlib.pyplot as plt
         import torch.nn.functional as F
-        import numpy as np
 
-        save_path = f"/home/user/Workspace/espnet/egs2/librispeech_100/asr1/exp/asr_conformer-rnnt-streaming_raw_en_bpe2048_sp/baseline_alignment.pdf"
-
+        save_path = f"/home/user/Workspace/espnet/egs2/librispeech_100/asr1/exp/asr_conformer-rnnt-streaming_raw_en_bpe2048_sp/{target_utt}_alignment.png"
 
         # softmax → 확률
         probs = F.softmax(joint_sample, dim=-1).cpu().detach()  # (T, U, V) V)
@@ -414,99 +357,16 @@ class ESPnetASRTransducerModel(AbsESPnetModel):
         
         text_labels = [self.token_list[label.item()] for label in labels if label.item() != -1]
 
-        path_t = true_label_probs.argmax(dim=0)
-
-        mask = torch.zeros_like(true_label_probs)
-        u_idx = torch.arange(path_t.size(0))
-        mask[path_t, u_idx] = true_label_probs[path_t, u_idx]
-
-        plt.figure(figsize=(3.5, 2.5))
-        # plt.imshow(
-        #     mask.T.detach().cpu(), 
-        #     origin="lower", aspect="auto", 
-        #     cmap="Reds", vmin=0, vmax=1
-        # )
-        # plt.imshow(true_label_probs.T, aspect='auto', origin='lower', vmin=0.0, vmax=1.0, cmap='viridis')
-        plt.imshow(
-            true_label_probs.T.detach().cpu(), 
-            origin="lower", aspect="auto", 
-            cmap="Reds", vmin=0, vmax=1, alpha=0.3
-        )
-
-        # argmax 경로를 점으로 시각화
-        mask_np = mask.detach().cpu().numpy()
-        t_coords, u_coords = np.where(mask_np > 0)  # x=t, y=u (원래 shape 기준)
-
-        # 🔴 점 크기 (s), 색상 (c), 투명도 (alpha), 경계 없음 (edgecolors='none')
-        plt.scatter(t_coords, u_coords, c='darkred', marker='s', s=12, alpha=0.9, edgecolors='none')
-
-        step = max(1, U // 5)
-        yt = np.arange(0, U, step)
-        plt.yticks(yt)
-
-        # plt.colorbar()
+        plt.figure(figsize=(10, 6))
+        plt.imshow(true_label_probs.T, aspect='auto', origin='lower', vmin=0.0, vmax=1.0, cmap='viridis')
+        plt.colorbar()
         plt.xlabel('Time steps (T)')
-        plt.ylabel('Text steps index (U)')
-        plt.xticks()
-        plt.yticks()
-        # plt.title('Transducer Probability Alignment')
-        plt.tight_layout()
+        plt.ylabel('Text steps (U)')
+        plt.title('Transducer Probability Alignment')
 
-        # plt.yticks(ticks=range(U), labels=text_labels)
-        plt.savefig(save_path, format='pdf', bbox_inches='tight', dpi=300)
+        plt.yticks(ticks=range(U), labels=text_labels)
+        plt.savefig(save_path, format='png', dpi=300)
         exit()
-
-        # plt.figure(figsize=(10, 6))
-        # # plt.imshow(true_label_probs.T, aspect='auto', origin='lower', vmin=0.0, vmax=1.0, cmap='viridis')
-        # plt.imshow(
-        #     mask_thresh.T.detach().cpu(), 
-        #     origin="lower", aspect="auto", 
-        #     cmap="viridis", vmin=0, vmax=1
-        # )
-        # plt.colorbar()
-        # plt.xlabel('Time steps (T)')
-        # plt.ylabel('Text steps (U)')
-        # plt.title('Transducer Probability Alignment')
-
-        # plt.yticks(ticks=range(U), labels=text_labels)
-        # plt.savefig(save_path, format='png', dpi=300)
-        # exit()
-
-    # def extract_alignment(
-    #     self,
-    #     joint_out,
-    #     target_utt,
-    #     labels,
-    #     T,
-    #     U,
-    # ):
-    #     import matplotlib.pyplot as plt
-    #     import torch.nn.functional as F
-
-    #     save_path = f"/home/user/Workspace/espnet/egs2/librispeech_100/asr1/exp/asr_conformer-rnnt-streaming_raw_en_bpe2048_sp/{target_utt}_alignment.png"
-
-    #     alignment = F.softmax(joint_out[1], dim=-1).cpu().detach()
-            
-        # true_label_probs = torch.zeros(T[1], U[1])
-
-    #     for t in range(T[1]):
-    #         for u in range(U[1]):
-    #             true_label_index = labels[1][u]
-    #             true_label_probs[t, u] = alignment[t, u, true_label_index]
-        
-    #     text_labels = [self.token_list[label.item()] for label in labels[1] if label.item() != -1]
-
-    #     plt.figure(figsize=(10, 6))
-    #     plt.imshow(true_label_probs.T, aspect='auto', origin='lower')
-    #     plt.colorbar()
-    #     plt.xlabel('Time steps (T)')
-    #     plt.ylabel('Text steps (U)')
-    #     plt.title('Transducer Probability Alignment')
-
-    #     plt.yticks(ticks=range(U[1]), labels=text_labels)
-    #     plt.savefig(save_path, format='png', dpi=300)
-    #     exit()
-
 
     def collect_feats(
         self,
@@ -565,8 +425,8 @@ class ESPnetASRTransducerModel(AbsESPnetModel):
             feats, feats_lengths = self._extract_feats(speech, speech_lengths)
 
             # 2. Data augmentation
-            # if self.specaug is not None and self.training:
-            #     feats, feats_lengths = self.specaug(feats, feats_lengths)
+            if self.specaug is not None and self.training:
+                feats, feats_lengths = self.specaug(feats, feats_lengths)
 
             # 3. Normalization for feature: e.g. Global-CMVN, Utterance-CMVN
             if self.normalize is not None:
@@ -611,6 +471,67 @@ class ESPnetASRTransducerModel(AbsESPnetModel):
             feats, feats_lengths = speech, speech_lengths
 
         return feats, feats_lengths
+    
+    def sinkhorn_knopp(self, cost_matrix, epsilon=1.0, max_iter=3):
+        n, m = cost_matrix.shape
+        u = torch.ones(n, device=cost_matrix.device) 
+        v = torch.ones(m, device=cost_matrix.device) 
+
+        K = torch.exp(-cost_matrix / epsilon)
+
+        prev_u, prev_v = None, None
+        for _ in range(max_iter):
+            prev_u, prev_v = u.clone(), v.clone()
+            u = 1.0 / (torch.matmul(K, v) + 1e-9)
+            v = 1.0 / (torch.matmul(K.T, u) + 1e-9)
+
+            # 변화량이 작으면 조기 종료
+            if torch.norm(u - prev_u) < 1e-4 and torch.norm(v - prev_v) < 1e-4:
+                break
+
+        transport_plan = torch.matmul(torch.diag(u), torch.matmul(K, torch.diag(v)))
+        return transport_plan
+    
+    def compute_cosine_cost_matrix(self, audio_features, text_features):
+        audio_norm = F.normalize(audio_features, p=2, dim=-1)
+        text_norm = F.normalize(text_features, p=2, dim=-1)
+
+        cosine_similarity = torch.matmul(audio_norm, text_norm.T)
+        cost_matrix = 1 - cosine_similarity
+        return cost_matrix
+    
+    def _calc_wasserstein_loss(self, audio_features, text_features, epsilon=1.0, max_iter=3):
+        batch_size, audio_len, feature_dim = audio_features.size()
+        _, text_len, _ = text_features.size()
+        
+        total_wasserstein_loss = 0.0
+
+        for i in range(batch_size):
+            # cost_matrix = torch.cdist(audio_features[i], text_features[i])  # (audio_len, text_len)
+            cost_matrix = self.compute_cosine_cost_matrix(audio_features[i], text_features[i])
+            transport_plan = self.sinkhorn_knopp(cost_matrix, epsilon, max_iter)  # (audio_len, text_len)
+
+            T, U = cost_matrix.shape
+            
+            mu = torch.ones(T, device=cost_matrix.device) / T  # Source distribution : use uniform distribution
+            nu = torch.ones(U, device=cost_matrix.device) / U  # Target distribution : use uniform distribution
+
+            # Wasserstein 손실 계산 with Entropy regularization
+            entropy_term = torch.sum(transport_plan * torch.log(transport_plan + 1e-9))
+            wasserstein_loss = torch.sum(transport_plan * cost_matrix) - (epsilon * entropy_term)
+            
+
+            # KL divergence penalties for Unbalanced OT cost
+            row_sum = torch.sum(transport_plan, dim=1)
+            col_sum = torch.sum(transport_plan, dim=0)
+            kl_row = torch.sum(row_sum * (torch.log(row_sum / mu) -1) + mu)
+            kl_col = torch.sum(col_sum * (torch.log(col_sum / nu) -1) + nu)
+            uot_weight = random.uniform(0.0, 0.5)
+            total_wasserstein_loss += (wasserstein_loss + (uot_weight * (kl_row + kl_col)))
+
+        total_wasserstein_loss /= batch_size
+
+        return total_wasserstein_loss
 
     def _calc_transducer_loss(
         self,
@@ -765,12 +686,6 @@ class ESPnetASRTransducerModel(AbsESPnetModel):
 
         joint_out = self.joint_network(am_pruned, lm_pruned, no_projection=True)
 
-        # k2에서 alignment를 위한 joint output 생성 (am + lm)
-        # am: (B, T, V), lm: (B, U, V) -> (B, T, U, V)
-        am_expanded = am.unsqueeze(2)  # (B, T, 1, V)
-        lm_expanded = lm.unsqueeze(1)  # (B, 1, U, V)
-        k2_joint_out = am_expanded + lm_expanded  # (B, T, U, V)
-
         with autocast(False):
             pruned_loss = k2.rnnt_loss_pruned(
                 joint_out.float(),
@@ -786,7 +701,7 @@ class ESPnetASRTransducerModel(AbsESPnetModel):
             simple_loss_scaling * simple_loss + pruned_loss_scaling * pruned_loss
         )
 
-        return loss_transducer, joint_out, k2_joint_out
+        return loss_transducer
 
     def _calc_ctc_loss(
         self,

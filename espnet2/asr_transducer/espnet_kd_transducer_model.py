@@ -76,6 +76,7 @@ class ESPnetASRKDTransducerModel(AbsESPnetModel):
         teacher_model: AbsESPnetModel,
         kd_weight: float = 0.3,
         temp_tau: float = 1.0,
+        extract_alignment: bool = False,
         transducer_weight: float = 1.0,
         use_k2_pruned_loss: bool = False,
         k2_pruned_loss_args: Dict = {},
@@ -118,7 +119,6 @@ class ESPnetASRKDTransducerModel(AbsESPnetModel):
         self.criterion_transducer = None
         self.error_calculator = None
 
-        self.alignment_gate = torch.nn.Parameter(torch.tensor(0.0))  # 초기값 0으로 설정
         self.training_step = 0
 
         self.use_auxiliary_ctc = auxiliary_ctc_weight > 0
@@ -179,6 +179,7 @@ class ESPnetASRKDTransducerModel(AbsESPnetModel):
         speech_lengths: torch.Tensor,
         text: torch.Tensor,
         text_lengths: torch.Tensor,
+        utt_id: List[str],
         **kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
         """Forward architecture and compute loss(es).
@@ -206,10 +207,26 @@ class ESPnetASRKDTransducerModel(AbsESPnetModel):
 
         with torch.no_grad():
             self.training_step += 1
+
         batch_size = speech.shape[0]
         text = text[:, : text_lengths.max()]
 
+        # Extract Alignment option
+        if self.extract_alignment:
+            target_utt = "103-1240-0006"
+            if target_utt not in utt_id:
+                extract_alignment = True
+                with torch.no_grad():
+                    loss = torch.zeros([], device=speech.device, requires_grad=True)
+                    stats = {}
+                    weight = torch.ones(1, device=speech.device)
+                return loss, stats, weight
         
+
+            self.eval()  
+            idx = utt_id.index(target_utt)
+
+
         with torch.no_grad():
             # 1-1. Teacher Encoder
             teacher_encoder_out, teacher_encoder_out_lens = self.teacher_encode(speech, speech_lengths)
@@ -229,8 +246,6 @@ class ESPnetASRKDTransducerModel(AbsESPnetModel):
             teacher_joint_out = self.teacher_model.joint_network(
                 teacher_encoder_out.unsqueeze(2), teacher_decoder_out.unsqueeze(1)
             )
-
-
 
         # 1. Encoder
         encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
@@ -256,6 +271,13 @@ class ESPnetASRKDTransducerModel(AbsESPnetModel):
                 encoder_out.unsqueeze(2), decoder_out.unsqueeze(1)
             )
             
+            if self.extract_alignment:
+                with no_grad():
+                    self.extract_alignment(joint_out[idx], text[idx], t_len[idx].item(), u_len[idx].item(), target_utt)
+                    self.train()
+                    exit()
+
+
             loss_trans = self._calc_transducer_loss(
                 encoder_out,
                 joint_out,

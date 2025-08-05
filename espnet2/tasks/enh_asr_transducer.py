@@ -19,7 +19,7 @@ from espnet2.asr_transducer.decoder.rnn_decoder import RNNDecoder
 from espnet2.asr_transducer.decoder.rwkv_decoder import RWKVDecoder
 from espnet2.asr_transducer.decoder.stateless_decoder import StatelessDecoder
 from espnet2.asr_transducer.encoder.encoder import Encoder
-from espnet2.asr_transducer.espnet_uot_transducer_model import ESPnetASRUOTTransducerModel
+from espnet2.asr_transducer.espnet_transducer_model import ESPnetASRTransducerModel
 from espnet2.asr_transducer.joint_network import JointNetwork
 from espnet2.layers.abs_normalize import AbsNormalize
 from espnet2.layers.global_mvn import GlobalMVN
@@ -116,36 +116,6 @@ class ASRTransducerTask(AbsTask):
             help="The number of dimensions for input features.",
         )
         group.add_argument(
-            "--ot_weight",
-            type=float_or_none,
-            default=0.5,
-            help="The optimal transport weight value.",
-        )
-        group.add_argument(
-            "--uot_weight",
-            type=float_or_none,
-            default=0.3,
-            help="The unabalanced optimal transport weight value.",
-        )
-        group.add_argument(
-            "--epsilon",
-            type=float_or_none,
-            default=1.0,
-            help="The optimal transport epsilon value.",
-        )
-        group.add_argument(
-            "--max_iter",
-            type=int_or_none,
-            default=5,
-            help="The optimal transport iteration value.",
-        )
-        group.add_argument(
-            "--extract_alignment",
-            type=bool_or_none,
-            default=False,
-            help="Check extract alignment.",
-        )
-        group.add_argument(
             "--init",
             type=str_or_none,
             default=None,
@@ -154,7 +124,7 @@ class ASRTransducerTask(AbsTask):
         group.add_argument(
             "--model_conf",
             action=NestedDictAction,
-            default=get_default_kwargs(ESPnetASRUOTTransducerModel),
+            default=get_default_kwargs(ESPnetASRTransducerModel),
             help="The keyword arguments for the model class.",
         )
         group.add_argument(
@@ -361,7 +331,7 @@ class ASRTransducerTask(AbsTask):
 
     @classmethod
     @typechecked
-    def build_model(cls, args: argparse.Namespace) -> ESPnetASRUOTTransducerModel:
+    def build_model(cls, args: argparse.Namespace, teacher=False) -> ESPnetASRTransducerModel:
         """Required data depending on task mode.
 
         Args:
@@ -439,7 +409,7 @@ class ASRTransducerTask(AbsTask):
         )
 
         # 7. Build model
-        model = ESPnetASRUOTTransducerModel(
+        model = ESPnetASRTransducerModel(
             vocab_size=vocab_size,
             token_list=token_list,
             frontend=frontend,
@@ -448,11 +418,6 @@ class ASRTransducerTask(AbsTask):
             encoder=encoder,
             decoder=decoder,
             joint_network=joint_network,
-            ot_weight=args.ot_weight,
-            uot_weight=args.uot_weight,
-            epsilon=args.epsilon,
-            max_iter=args.max_iter,
-            extract_alignment=args.extract_alignment,
             **args.model_conf,
         )
 

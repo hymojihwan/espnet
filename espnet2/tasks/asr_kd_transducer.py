@@ -165,6 +165,12 @@ class ASRTransducerTask(AbsTask):
             default=1.0,
             help="The temperature scaling vaule.",
         )
+        group.add_argument(
+            "--extract_alignment",
+            type=bool_or_none,
+            default=False,
+            help="Check extract alignment.",
+        )
         group = parser.add_argument_group(description="Preprocess related.")
 
         group.add_argument(
@@ -446,6 +452,7 @@ class ASRTransducerTask(AbsTask):
             teacher_model=teacher_model,
             kd_weight=args.kd_weight,
             temp_tau=args.temp_tau,
+            extract_alignment=args.extract_alignment,
             **args.model_conf,
         )
 

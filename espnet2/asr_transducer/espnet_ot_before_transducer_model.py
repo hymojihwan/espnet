@@ -4,7 +4,6 @@ import logging
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple, Union
 
-import random
 import torch
 import torch.nn.functional as F
 from packaging.version import parse as V
@@ -31,7 +30,7 @@ else:
         yield
 
 
-class ESPnetASRUOTTransducerModel(AbsESPnetModel):
+class ESPnetASROTTransducerModel(AbsESPnetModel):
     """ESPnet2ASRTransducerModel module definition.
 
     Args:
@@ -75,10 +74,8 @@ class ESPnetASRUOTTransducerModel(AbsESPnetModel):
         decoder: AbsDecoder,
         joint_network: JointNetwork,
         ot_weight: float = 0.5,
-        uot_weight: float = 0.5,
         epsilon: float = 1.0,
         max_iter: int = 5,
-        extract_alignment: bool = False,
         transducer_weight: float = 1.0,
         use_k2_pruned_loss: bool = False,
         k2_pruned_loss_args: Dict = {},
@@ -88,7 +85,7 @@ class ESPnetASRUOTTransducerModel(AbsESPnetModel):
         auxiliary_ctc_weight: float = 0.0,
         auxiliary_ctc_dropout_rate: float = 0.0,
         auxiliary_lm_loss_weight: float = 0.0,
-        auxiliary_lm_loss_smoothing: float = 0.0*5,
+        auxiliary_lm_loss_smoothing: float = 0.05,
         ignore_id: int = -1,
         sym_space: str = "<space>",
         sym_blank: str = "<blank>",
@@ -129,10 +126,8 @@ class ESPnetASRUOTTransducerModel(AbsESPnetModel):
 
         self.ot_proj = torch.nn.Linear(encoder.output_size, vocab_size)
         self.ot_weight = ot_weight
-        self.uot_weight = uot_weight
         self.epsilon = epsilon
         self.max_iter = max_iter
-        self.extract_alignment = extract_alignment
 
         if use_k2_pruned_loss:
             self.am_proj = torch.nn.Linear(
@@ -183,7 +178,6 @@ class ESPnetASRUOTTransducerModel(AbsESPnetModel):
         speech_lengths: torch.Tensor,
         text: torch.Tensor,
         text_lengths: torch.Tensor,
-        utt_id: List[str],
         **kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
         """Forward architecture and compute loss(es).
@@ -211,21 +205,6 @@ class ESPnetASRUOTTransducerModel(AbsESPnetModel):
 
         with torch.no_grad():
             self.training_step += 1
-
-        # Extract Alignment option
-        if self.extract_alignment:
-            target_utt = "103-1240-0006"
-            if target_utt not in utt_id:
-                extract_alignment = True
-                with torch.no_grad():
-                    loss = torch.zeros([], device=speech.device, requires_grad=True)
-                    stats = {}
-                    weight = torch.ones(1, device=speech.device)
-                return loss, stats, weight
-
-            self.eval()  
-            idx = utt_id.index(target_utt)
-
         batch_size = speech.shape[0]
         text = text[:, : text_lengths.max()]
 
@@ -255,22 +234,12 @@ class ESPnetASRUOTTransducerModel(AbsESPnetModel):
             
             if self.training:
                 # 4-1. Optimal transport computation between audio encoder and prediction network outputs
-                loss_wasserstein, aligned_features = self._calc_wasserstein_loss(
+                loss_wasserstein, _ = self._calc_wasserstein_loss(
                     encoder_out,
                     decoder_out,
                     epsilon=self.epsilon,
-                    max_iter=self.max_iter,
-                    uot_weight=self.uot_weight
+                    max_iter=self.max_iter
                 )
-                ot_alignment = self.ot_proj(aligned_features)
-                ot_alignment = self.joint_network.joint_activation(ot_alignment)
-                lambda_ot = torch.sigmoid(self.alignment_gate) * min(1.0, self.training_step / 5000)
-                joint_out = joint_out + lambda_ot * (ot_alignment - joint_out)
-
-                if self.extract_alignment:
-                    self.extract_alignment(joint_out[idx], text[idx], t_len[idx].item(), u_len[idx].item(), target_utt)
-                    self.train()
-                    exit()
 
             loss_trans = self._calc_transducer_loss(
                 encoder_out,
@@ -279,6 +248,7 @@ class ESPnetASRUOTTransducerModel(AbsESPnetModel):
                 t_len,
                 u_len,
             )
+        
 
         # 5. Auxiliary losses
         loss_ctc, loss_lm = 0.0, 0.0
@@ -293,17 +263,18 @@ class ESPnetASRUOTTransducerModel(AbsESPnetModel):
 
         if self.use_auxiliary_lm_loss:
             loss_lm = self._calc_lm_loss(decoder_out, target)
-
         if self.training:
-            loss = (self.transducer_weight * loss_trans
+            loss = ((1 - self.ot_weight) * (
+                self.transducer_weight * loss_trans
                 + self.auxiliary_ctc_weight * loss_ctc
-                + self.auxiliary_lm_loss_weight * loss_lm)
-            loss = (1.0 - self.ot_weight) * loss + self.ot_weight * loss_wasserstein
+                + self.auxiliary_lm_loss_weight * loss_lm
+            )) + (self.ot_weight * loss_wasserstein)
         else:
             loss = (self.transducer_weight * loss_trans
                 + self.auxiliary_ctc_weight * loss_ctc
                 + self.auxiliary_lm_loss_weight * loss_lm)
             
+
         # 6. CER/WER computation.
         if not self.training and (self.report_cer or self.report_wer):
             if self.error_calculator is None:
@@ -328,12 +299,11 @@ class ESPnetASRUOTTransducerModel(AbsESPnetModel):
             )
         else:
             cer_transducer, wer_transducer = None, None
-
+        
         stats = dict(
             loss=loss.detach(),
             loss_transducer=loss_trans.detach(),
             loss_wasserstein=loss_wasserstein.detach() if self.training else None,
-            lamda_ot=lambda_ot.detach() if self.training else None,
             loss_aux_ctc=loss_ctc.detach() if loss_ctc > 0.0 else None,
             loss_aux_lm=loss_lm.detach() if loss_lm > 0.0 else None,
             cer_transducer=cer_transducer,
@@ -380,69 +350,6 @@ class ESPnetASRUOTTransducerModel(AbsESPnetModel):
             feats, feats_lengths = speech, speech_lengths
 
         return {"feats": feats, "feats_lengths": feats_lengths}
-
-
-    def extract_alignment(
-        self,
-        joint_sample,
-        labels,
-        T,
-        U,
-        target_utt,
-    ):
-        import matplotlib.pyplot as plt
-        import torch.nn.functional as F
-        import numpy as np
-        save_path = f"/home/user/Workspace/espnet/egs2/librispeech_100/asr1/exp/asr_conformer-rnnt-uot-streaming_raw_en_bpe2048_sp/uot_alignment.pdf"
-
-        # softmax → 확률
-        probs = F.softmax(joint_sample, dim=-1).cpu().detach()  # (T, U, V) V)
-
-        true_label_probs = torch.zeros(T, U)
-        for t in range(T):
-            for u in range(U):
-                true_label_index = labels[u].item()
-                true_label_probs[t, u] = probs[t, u, true_label_index]
-        
-
-        text_labels = [self.token_list[label.item()] for label in labels if label.item() != -1]
-
-        path_t = true_label_probs.argmax(dim=0)
-
-        mask = torch.zeros_like(true_label_probs)
-        u_idx = torch.arange(path_t.size(0))
-        mask[path_t, u_idx] = true_label_probs[path_t, u_idx]
-
-
-        plt.figure(figsize=(3.5, 2.5))
-        plt.imshow(
-            true_label_probs.T.detach().cpu(), 
-            origin="lower", aspect="auto", 
-            cmap="Reds", vmin=0, vmax=1, alpha=0.3
-        )
-
-        # argmax 경로를 점으로 시각화
-        mask_np = mask.detach().cpu().numpy()
-        t_coords, u_coords = np.where(mask_np > 0)  # x=t, y=u (원래 shape 기준)
-
-        # 🔴 점 크기 (s), 색상 (c), 투명도 (alpha), 경계 없음 (edgecolors='none')
-        plt.scatter(t_coords, u_coords, c='darkred', marker='s', s=12, alpha=0.9, edgecolors='none')
-
-        step = max(1, U // 5)
-        yt = np.arange(0, U, step)
-        plt.yticks(yt)
-
-        # plt.colorbar()
-        plt.xlabel('Time steps (T)')
-        plt.ylabel('Text steps index (U)')
-        plt.xticks()
-        plt.yticks()
-        # plt.title('Transducer Probability Alignment')
-        plt.tight_layout()
-
-        # plt.yticks(ticks=range(U), labels=text_labels)
-        plt.savefig(save_path, format='pdf', bbox_inches='tight', dpi=300)
-        exit()
 
     def encode(
         self,
@@ -524,7 +431,7 @@ class ESPnetASRUOTTransducerModel(AbsESPnetModel):
             prev_u, prev_v = u.clone(), v.clone()
             u = 1.0 / (torch.matmul(K, v) + 1e-9)
             v = 1.0 / (torch.matmul(K.T, u) + 1e-9)
-
+            
             # 변화량이 작으면 조기 종료
             if torch.norm(u - prev_u) < 1e-4 and torch.norm(v - prev_v) < 1e-4:
                 break
@@ -540,40 +447,37 @@ class ESPnetASRUOTTransducerModel(AbsESPnetModel):
         cost_matrix = 1 - cosine_similarity
         return cost_matrix
     
-    def _calc_wasserstein_loss(self, audio_features, text_features, epsilon=1.0, max_iter=3, uot_weight=0.3):
+    def _calc_wasserstein_loss(self, audio_features, text_features, epsilon=1.0, max_iter=3):
         batch_size, audio_len, feature_dim = audio_features.size()
         _, text_len, _ = text_features.size()
-        aligned_features = []
-
+        
         total_wasserstein_loss = 0.0
+        aligned_features = []
 
         for i in range(batch_size):
             # cost_matrix = torch.cdist(audio_features[i], text_features[i])  # (audio_len, text_len)
             cost_matrix = self.compute_cosine_cost_matrix(audio_features[i], text_features[i])
             transport_plan = self.sinkhorn_knopp(cost_matrix, epsilon, max_iter)  # (audio_len, text_len)
-
-            T, U = cost_matrix.shape
             
-            mu = torch.ones(T, device=cost_matrix.device) / T  # Source distribution : use uniform distribution
-            nu = torch.ones(U, device=cost_matrix.device) / U  # Target distribution : use uniform distribution
+            # # Audio feature alignment (T, U, D)
+            # aligned_audio = torch.einsum('tu,td -> tud', transport_plan, audio_features[i])
 
+            # # Text feature alignment (T, U, D)
+            # aligned_text = torch.einsum('tu,ud -> tud', transport_plan, text_features[i])
+            # aligned_feature = torch.cat([aligned_audio, aligned_text], dim=-1)  # (T, U, 2D)
+
+            # aligned_features.append(aligned_feature)  # 위치 정보 제거
+            # 정렬된 오디오 특징 계산
+            aligned_feature = torch.einsum('tu,td, ud -> tud', transport_plan, audio_features[i], text_features[i])
+            aligned_features.append(aligned_feature)  # 위치 정보 제거
+            
             # Wasserstein 손실 계산 with Entropy regularization
             entropy_term = torch.sum(transport_plan * torch.log(transport_plan + 1e-9))
             wasserstein_loss = torch.sum(transport_plan * cost_matrix) - (epsilon * entropy_term)
-            aligned_feature = torch.einsum('tu,td, ud -> tud', transport_plan, audio_features[i], text_features[i])
-            aligned_features.append(aligned_feature)  # 위치 정보 제거            
-
-            # KL divergence penalties for Unbalanced OT cost
-            row_sum = torch.sum(transport_plan, dim=1)
-            col_sum = torch.sum(transport_plan, dim=0)
-            kl_row = torch.sum(row_sum * (torch.log(row_sum / mu) -1) + mu)
-            kl_col = torch.sum(col_sum * (torch.log(col_sum / nu) -1) + nu)
-            # uot_weight = random.uniform(0.0, 0.5)
-            total_wasserstein_loss += (wasserstein_loss + (uot_weight * (kl_row + kl_col)))
+            total_wasserstein_loss += wasserstein_loss
 
         total_wasserstein_loss /= batch_size
         aligned_features = torch.stack(aligned_features, dim=0)  # (batch_size, audio_len, text_len, feature_dim)
-
 
         return total_wasserstein_loss, aligned_features
 

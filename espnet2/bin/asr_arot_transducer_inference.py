@@ -22,7 +22,7 @@ from espnet2.asr_transducer.beam_search_transducer import (
 from espnet2.asr_transducer.frontend.online_audio_processor import OnlineAudioProcessor
 from espnet2.asr_transducer.utils import TooShortUttError
 from espnet2.fileio.datadir_writer import DatadirWriter
-from espnet2.tasks.asr_transducer import ASRTransducerTask
+from espnet2.tasks.asr_arot_transducer import ASRTransducerTask
 from espnet2.tasks.lm import LMTask
 from espnet2.text.build_tokenizer import build_tokenizer
 from espnet2.text.token_id_converter import TokenIDConverter
@@ -208,7 +208,7 @@ class Speech2Text:
         self,
         speech: Union[torch.Tensor, np.ndarray],
         is_final: bool = False,
-    ) -> Tuple[List[Hypothesis], torch.Tensor]:
+    ) -> List[Hypothesis]:
         """Speech2Text streaming call.
 
         Args:
@@ -217,7 +217,6 @@ class Speech2Text:
 
         Returns:
             nbest_hypothesis: N-best hypothesis.
-            enc_out: Encoder output for partial latency calculation.
 
         """
         nbest_hyps = []
@@ -244,11 +243,11 @@ class Speech2Text:
         if is_final:
             self.reset_streaming_cache()
 
-        return nbest_hyps, enc_out
+        return nbest_hyps
 
     @torch.no_grad()
     @typechecked
-    def __call__(self, speech: Union[torch.Tensor, np.ndarray]) -> Tuple[List[Hypothesis], torch.Tensor]:
+    def __call__(self, speech: Union[torch.Tensor, np.ndarray]) -> List[Hypothesis]:
         """Speech2Text call.
 
         Args:
@@ -256,7 +255,6 @@ class Speech2Text:
 
         Returns:
             nbest_hypothesis: N-best hypothesis.
-            enc_out: Encoder output for partial latency calculation.
 
         """
 
@@ -279,7 +277,7 @@ class Speech2Text:
 
         nbest_hyps = self.beam_search(enc_out[0])
 
-        return nbest_hyps, enc_out
+        return nbest_hyps
 
     def hypotheses_to_results(self, nbest_hyps: List[Hypothesis]) -> List[Any]:
         """Build partial or final results from the hypotheses.
@@ -305,75 +303,6 @@ class Speech2Text:
             results.append((text, token, token_int, hyp))
 
         return results
-
-    def calculate_partial_latency(self, enc_out: torch.Tensor, token_int: List[int]) -> float:
-        """Calculate partial latency by tracking when the last token is emitted.
-        
-        Args:
-            enc_out: Encoder output tensor
-            token_int: Token sequence (without blank tokens)
-            
-        Returns:
-            last_time_ms: Time in milliseconds to last token emission
-        """
-        if len(token_int) == 0:
-            return 0.0
-            
-        try:
-            # 실제 beam search 과정에서 마지막 토큰 emit 시점 추적
-            T = enc_out.size(0)
-            last_emit_frame = 0
-            
-            # 각 frame에서 마지막 토큰이 emit되는지 확인
-            for t in range(T):
-                # 현재 frame에서의 encoder 출력
-                current_enc = enc_out[t:t+1]  # (1, D)
-                
-                # 마지막 토큰이 현재 frame에서 emit되는지 확인
-                last_token = token_int[-1]
-                
-                # Decoder 시퀀스 생성 (blank + 모든 토큰들)
-                decoder_seq = [0] + token_int
-                decoder_input = torch.tensor([decoder_seq], dtype=torch.long, device=self.device)
-                decoder_out = self.asr_model.decoder(decoder_input)
-                
-                # Joint network 계산
-                joint = self.asr_model.joint_network(
-                    current_enc.unsqueeze(1).unsqueeze(2),  # (1, 1, 1, D)
-                    decoder_out.unsqueeze(1)  # (1, 1, U, D)
-                )
-                
-                # 마지막 decoder step에서 마지막 토큰의 확률 확인
-                if joint.dim() == 4:
-                    joint = joint.squeeze(0).squeeze(0)  # (1, V)
-                elif joint.dim() == 3:
-                    joint = joint.squeeze(0)  # (1, V)
-                
-                probs = torch.softmax(joint, dim=-1)
-                last_token_prob = probs[0, last_token].item()
-                
-                # 높은 확률로 마지막 토큰이 emit되는지 확인
-                if last_token_prob > 0.5:  # 임계값
-                    last_emit_frame = t
-                    break
-            
-            # frame -> ms 변환
-            hop = self.asr_model.encoder.embed.subsampling_factor * self.asr_model.frontend.hop_length
-            sr = 16000
-            last_time_ms = last_emit_frame * hop / sr * 1000.0
-            
-            logging.debug(f"Token sequence: {token_int}")
-            logging.debug(f"Last token: {last_token}, Last emit frame: {last_emit_frame}, Last time ms: {last_time_ms:.1f}")
-            
-            return last_time_ms
-            
-        except Exception as e:
-            # logging.warning(f"Error in calculate_partial_latency: {e}")
-            # 에러 발생 시 기본값 반환
-            hop = self.asr_model.encoder.embed.subsampling_factor * self.asr_model.frontend.hop_length
-            sr = 16000
-            last_time_ms = (enc_out.size(0) - 1) * hop / sr * 1000.0
-            return last_time_ms
 
     @staticmethod
     def from_pretrained(
@@ -403,8 +332,6 @@ class Speech2Text:
             kwargs.update(**d.download_and_unpack(model_tag))
 
         return Speech2Text(**kwargs)
-
-
 
 
 @typechecked
@@ -437,8 +364,6 @@ def inference(
     decoding_window: int,
     left_context: int,
     display_hypotheses: bool,
-    min_duration: float,
-    max_duration: float,
 ) -> None:
     """Transducer model inference.
 
@@ -472,8 +397,6 @@ def inference(
         left_context: Number of previous frames the attention module can see
                       in current chunk (used by Conformer and Branchformer block).
         display_hypotheses: Whether to display (partial and full) hypotheses.
-        min_duration: Minimum duration in seconds. Audio shorter than this will be skipped.
-        max_duration: Maximum duration in seconds. Audio longer than this will be skipped.
 
     """
 
@@ -521,13 +444,8 @@ def inference(
         **speech2text_kwargs,
     )
 
-    logging.info(f"Streaming mode: {speech2text.streaming}")
-    logging.info(f"Decoding window: {decoding_window}")
-    logging.info(f"Left context: {left_context}")
-
     if speech2text.streaming:
         decoding_samples = speech2text.audio_processor.decoding_samples
-        logging.info(f"Decoding samples: {decoding_samples}")
 
     # 3. Build data-iterator
     loader = ASRTransducerTask.build_streaming_iterator(
@@ -547,8 +465,6 @@ def inference(
     )
 
     # 4 .Start for-loop
-    partial_latencies = []  # Store partial latencies for statistics
-    
     with DatadirWriter(output_dir) as writer:
         for keys, batch in loader:
             assert isinstance(batch, dict), type(batch)
@@ -559,197 +475,38 @@ def inference(
             batch = {k: v[0] for k, v in batch.items() if not k.endswith("_lengths")}
             assert len(batch.keys()) == 1
 
-            # Duration filtering
-            speech = batch["speech"]
-            audio_duration = len(speech) / 16000.0  # seconds
-            
-            if audio_duration < min_duration:
-                logging.warning(f"Skipping {keys[0]}: too short ({audio_duration:.2f}s < {min_duration}s)")
-                continue
-                
-            if audio_duration > max_duration:
-                logging.warning(f"Skipping {keys[0]}: too long ({audio_duration:.2f}s > {max_duration}s)")
-                continue
-
             try:
                 if speech2text.streaming:
-                    logging.info(f"Using streaming mode for utterance {keys[0]}")
                     speech = batch["speech"]
-                    last_label_emit_frame = None
-                    total_chunks = (len(speech) + decoding_samples - 1) // decoding_samples
-                    logging.info(f"Total audio length: {len(speech)} samples ({len(speech)/16000:.2f}s)")
-                    logging.info(f"Total chunks: {total_chunks}")
 
-                    # 각 utterance 시작 전에 캐시 완전 리셋
-                    speech2text.reset_streaming_cache()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    
-                    # 추가적인 캐시 상태 확인 및 리셋
-                    if hasattr(speech2text.audio_processor, 'samples') and speech2text.audio_processor.samples is not None:
-                        speech2text.audio_processor.samples = None
-                    if hasattr(speech2text.audio_processor, 'feats') and speech2text.audio_processor.feats is not None:
-                        speech2text.audio_processor.feats = None
+                    decoding_steps = len(speech) // decoding_samples
 
-                    # chunk-by-chunk inference
-                    last_token_emit_time_ms = 0.0
-                    accumulated_frames = 0
-                    previous_token_count = 0
-                    
-                    for i in range(0, len(speech), decoding_samples):
-                        chunk = speech[i : i + decoding_samples]
-                        chunk_idx = i // decoding_samples
-                        
-                        try:
-                            hyps, enc_out = speech2text.streaming_decode(chunk, is_final=False)
-                        except RuntimeError as e:
-                            error_msg = str(e)
-                            if ("invalid storage offset" in error_msg or 
-                                "exceeds dimension size" in error_msg or
-                                "out of bounds" in error_msg or
-                                "Kernel size can't be greater than actual input size" in error_msg):
-                                logging.warning(f"Cache error in chunk {chunk_idx}: {error_msg}")
-                                
-                                # 첫 번째 청크에서 에러가 발생하면 전체 utterance 스킵
-                                if chunk_idx == 0:
-                                    logging.error(f"First chunk failed, skipping entire utterance {keys[0]}")
-                                    break  # 전체 utterance 스킵
-                                
-                                # 완전한 캐시 리셋 시도
-                                try:
-                                    # 모든 상태를 완전히 리셋
-                                    speech2text.reset_streaming_cache()
-                                    
-                                    # 추가적인 캐시 상태 확인 및 리셋
-                                    if hasattr(speech2text.audio_processor, 'samples') and speech2text.audio_processor.samples is not None:
-                                        speech2text.audio_processor.samples = None
-                                    if hasattr(speech2text.audio_processor, 'feats') and speech2text.audio_processor.feats is not None:
-                                        speech2text.audio_processor.feats = None
-                                    
-                                    if torch.cuda.is_available():
-                                        torch.cuda.empty_cache()
-                                    
-                                    # 이 청크를 다시 시도
-                                    hyps, enc_out = speech2text.streaming_decode(chunk, is_final=False)
-                                    logging.info(f"Cache reset successful for chunk {chunk_idx}")
-                                except RuntimeError as retry_error:
-                                    logging.error(f"Cache reset failed for chunk {chunk_idx}: {retry_error}")
-                                    logging.error("Skipping this chunk and continuing...")
-                                    continue
-                            else:
-                                raise e
-                        
-                        best = hyps[0]
-                        token_int = [t for t in best.yseq if t not in (0, speech2text.asr_model.ignore_id)]
-                        cur_len = len(token_int)
+                    for i in range(0, decoding_steps + 1, 1):
+                        _start = i * decoding_samples
 
-                        # 현재 청크에서 처리된 프레임 수
-                        frames_in_chunk = enc_out.size(1)
-                        accumulated_frames += frames_in_chunk
-                        
-                        # 새로운 토큰이 emit되었는지 확인
-                        if cur_len > previous_token_count:
-                            # 새로운 토큰이 emit된 시점 계산
-                            # 현재 청크에서 마지막 토큰이 emit된 시점
-                            last_token_time_ms = speech2text.calculate_partial_latency(enc_out, token_int)
-                            
-                            # 이전 청크들의 시간 + 현재 청크에서의 emit 시간
-                            previous_time_ms = (accumulated_frames - frames_in_chunk) * speech2text.asr_model.encoder.embed.subsampling_factor * speech2text.asr_model.frontend.hop_length / 16000.0 * 1000.0
-                            last_token_emit_time_ms = previous_time_ms + last_token_time_ms
-                            
-                            logging.debug(f"Chunk {chunk_idx}: new tokens emitted, frames={frames_in_chunk}, tokens={cur_len}, emit_time={last_token_emit_time_ms:.1f}ms")
-                        
-                        previous_token_count = cur_len
-                        
-                        # 메모리 정리 (각 청크 처리 후)
-                        del hyps, enc_out
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-
-                    # 마지막 청크(is_final=True) 처리
-                    try:
-                        _ = speech2text.streaming_decode(
-                            speech[(i + decoding_samples) : len(speech)], is_final=True
-                        )
-                    except RuntimeError as e:
-                        error_msg = str(e)
-                        if ("invalid storage offset" in error_msg or 
-                            "exceeds dimension size" in error_msg or
-                            "out of bounds" in error_msg or
-                            "Kernel size can't be greater than actual input size" in error_msg):
-                            logging.warning(f"Cache error in final chunk: {error_msg}")
-                            
-                            try:
-                                speech2text.reset_streaming_cache()
-                                _ = speech2text.streaming_decode(
-                                    speech[(i + decoding_samples) : len(speech)], is_final=True
-                                )
-                                logging.info("Cache reset successful for final chunk")
-                            except RuntimeError as retry_error:
-                                logging.error(f"Cache reset failed for final chunk: {retry_error}")
-                                logging.error("Skipping final chunk...")
+                        if i == decoding_steps:
+                            final_hyps = speech2text.streaming_decode(
+                                speech[i * decoding_samples : len(speech)],
+                                is_final=True,
+                            )
                         else:
-                            raise e
+                            part_hyps = speech2text.streaming_decode(
+                                speech[
+                                    (i * decoding_samples) : _start + decoding_samples
+                                ],
+                                is_final=False,
+                            )
 
-                    # 기록
-                    ibest_writer = writer["1best_recog"]
-                    utt = keys[0]
-                    
-                    # 총 오디오 길이 (밀리초)
-                    total_audio_duration_ms = len(speech) / 16000.0 * 1000.0
-                    
-                    if last_token_emit_time_ms > 0:
-                        # Latency 계산: 총 오디오 길이 - 마지막 토큰 emit 시간
-                        latency_ms = total_audio_duration_ms - last_token_emit_time_ms
-                        
-                        ibest_writer["latency_ms"][utt] = f"{latency_ms:.1f}"
-                        ibest_writer["last_token_time_ms"][utt] = f"{last_token_emit_time_ms:.1f}"
-                        partial_latencies.append(latency_ms)
-                        logging.info(f"Total audio duration: {total_audio_duration_ms:.1f}ms")
-                        logging.info(f"Last token time: {last_token_emit_time_ms:.1f}ms")
-                        logging.info(f"Latency: {latency_ms:.1f}ms")
-                        logging.info(f"Accumulated frames: {accumulated_frames}")
-                        
-                        # 각 샘플의 latency를 개별 파일에 저장
-                        latency_file = Path(output_dir) / "latency_per_sample.txt"
-                        with open(latency_file, "a") as f:
-                            f.write(f"{utt}: {latency_ms:.1f}ms\n")
-                    else:
-                        ibest_writer["latency_ms"][utt] = "nan"
-                        ibest_writer["last_token_time_ms"][utt] = "nan"
+                            if display_hypotheses:
+                                _result = speech2text.hypotheses_to_results(part_hyps)
+                                _length = (i + 1) * decoding_window
 
-                    # 이제 최종 hypothesis 뽑아서 아래에서 token/text 기록
-                    final_hyps = [best]
-                    
-                    # utterance 완료 후 추가 메모리 정리
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                                logging.info(
+                                    f"Current best hypothesis (0-{_length}ms): "
+                                    f"{keys}: {_result[0][0]}"
+                                )
                 else:
-                    logging.info(f"Using non-streaming mode for utterance {keys[0]}")
-                    # Non-streaming mode - use the original simple approach
-                    final_hyps, enc_out = speech2text(**batch)
-                    
-                    # Latency calculation for non-streaming
-                    text, token, token_int, hyp = speech2text.hypotheses_to_results(final_hyps)[0]
-                    
-                    # 실제 마지막 토큰 emit 시점 계산
-                    last_token_time_ms = speech2text.calculate_partial_latency(enc_out, token_int)
-                    
-                    # Get audio duration from batch
-                    speech = batch["speech"]
-                    total_audio_duration_ms = speech.size(1) / 16000.0 * 1000.0  # milliseconds
-                    latency_ms = total_audio_duration_ms - last_token_time_ms
-                    
-                    ibest_writer = writer["1best_recog"]
-                    ibest_writer["latency_ms"][keys[0]] = f"{latency_ms:.1f}"
-                    ibest_writer["last_token_time_ms"][keys[0]] = f"{last_token_time_ms:.1f}"
-                    
-                    logging.info(f"Non-streaming - Total audio duration: {total_audio_duration_ms:.1f}ms")
-                    logging.info(f"Non-streaming - Last token time: {last_token_time_ms:.1f}ms")
-                    logging.info(f"Non-streaming - Latency: {latency_ms:.1f}ms")
-                    
-                    # 통계를 위해 저장
-                    partial_latencies.append(latency_ms)
+                    final_hyps = speech2text(**batch)
 
                 results = speech2text.hypotheses_to_results(final_hyps)
 
@@ -770,40 +527,6 @@ def inference(
 
                 if text is not None:
                     ibest_writer["text"][key] = text
-
-    # Print latency statistics
-    if partial_latencies:
-        latencies = np.array(partial_latencies)
-        logging.info("=" * 50)
-        logging.info("LATENCY STATISTICS (Total Duration - Last Token Time) (ms)")
-        logging.info("=" * 50)
-        logging.info(f"Number of samples: {len(latencies)}")
-        logging.info(f"Mean: {np.mean(latencies):.2f}")
-        logging.info(f"Std:  {np.std(latencies):.2f}")
-        logging.info(f"Min:  {np.min(latencies):.2f}")
-        logging.info(f"Max:  {np.max(latencies):.2f}")
-        logging.info(f"25th percentile: {np.percentile(latencies, 25):.2f}")
-        logging.info(f"50th percentile: {np.percentile(latencies, 50):.2f}")
-        logging.info(f"75th percentile: {np.percentile(latencies, 75):.2f}")
-        logging.info("=" * 50)
-        
-        # Save statistics to file
-        stats_file = Path(output_dir) / "latency_stats.txt"
-        with open(stats_file, "w") as f:
-            f.write("LATENCY STATISTICS (Total Duration - Last Token Time) (ms)\n")
-            f.write("=" * 50 + "\n")
-            f.write(f"Number of samples: {len(latencies)}\n")
-            f.write(f"Mean: {np.mean(latencies):.2f}\n")
-            f.write(f"Std:  {np.std(latencies):.2f}\n")
-            f.write(f"Min:  {np.min(latencies):.2f}\n")
-            f.write(f"Max:  {np.max(latencies):.2f}\n")
-            f.write(f"25th percentile: {np.percentile(latencies, 25):.2f}\n")
-            f.write(f"50th percentile: {np.percentile(latencies, 50):.2f}\n")
-            f.write(f"75th percentile: {np.percentile(latencies, 75):.2f}\n")
-            f.write("=" * 50 + "\n")
-            f.write("\nAll latencies:\n")
-            for i, lat in enumerate(latencies):
-                f.write(f"{i+1}: {lat:.2f}\n")
 
 
 def get_parser():
@@ -852,18 +575,6 @@ def get_parser():
     )
     group.add_argument("--key_file", type=str_or_none)
     group.add_argument("--allow_variable_data_keys", type=str2bool, default=False)
-    group.add_argument(
-        "--min_duration",
-        type=float,
-        default=0.1,
-        help="Minimum duration in seconds. Audio shorter than this will be skipped.",
-    )
-    group.add_argument(
-        "--max_duration",
-        type=float,
-        default=float('inf'),
-        help="Maximum duration in seconds. Audio longer than this will be skipped.",
-    )
 
     group = parser.add_argument_group("The model configuration related")
     group.add_argument(

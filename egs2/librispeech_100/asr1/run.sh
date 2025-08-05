@@ -10,7 +10,7 @@ valid_set="dev"
 test_sets="test_clean test_other"
 
 asr_task="asr_transducer"
-asr_config=conf/tuning/transducer/conformer-rnnt-streaming.yaml
+asr_config=conf/tuning/transducer/conformer-rnnt-streaming-fastemit.yaml
 inference_config=conf/tuning/transducer/decode_transducer.yaml
 inference_asr_model=valid.loss.ave_10best.pth
 
@@ -23,8 +23,8 @@ inference_asr_model=valid.loss.ave_10best.pth
     --nbpe 2048 \
     --max_wav_duration 30 \
     --asr_task "${asr_task}" \
-    --speed_perturb_factors "0.9 1.0 1.1" \
     --feats_type raw \
+    --speed_perturb_factors "0.9 1.0 1.1" \
     --use_lm false \
     --asr_config "${asr_config}" \
     --inference_config "${inference_config}" \

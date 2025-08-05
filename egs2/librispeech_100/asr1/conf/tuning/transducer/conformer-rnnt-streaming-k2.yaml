@@ -10,6 +10,7 @@ num_att_plot: 0
 unused_parameters: true    # set as true if some params are unused in DDP
 
 model_conf:
+    use_k2_pruned_loss: true
     transducer_weight: 1.0
     auxiliary_ctc_weight: 0.0
     report_cer: True

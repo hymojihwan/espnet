@@ -95,13 +95,22 @@ class OnlineAudioProcessor:
             n_frames = (samples_sz - self.win_hop_sz) // self.hop_sz
             n_residual = (samples_sz - self.win_hop_sz) % self.hop_sz
 
-            waveform_buffer = samples.narrow(
-                0,
-                samples_sz - self.win_hop_sz - n_residual,
-                self.win_hop_sz + n_residual,
-            )
+            # 안전장치: dimension 체크
+            start_idx = samples_sz - self.win_hop_sz - n_residual
+            buffer_size = self.win_hop_sz + n_residual
+            
+            if start_idx < 0 or start_idx + buffer_size > samples_sz:
+                # dimension mismatch가 발생하면 캐시를 리셋하고 현재 샘플만 사용
+                waveform_buffer = None
+                samples = samples.narrow(0, 0, min(samples_sz, self.decoding_samples))
+            else:
+                waveform_buffer = samples.narrow(
+                    0,
+                    start_idx,
+                    buffer_size,
+                )
 
-            samples = samples.narrow(0, 0, self.win_hop_sz + n_frames * self.hop_sz)
+                samples = samples.narrow(0, 0, self.win_hop_sz + n_frames * self.hop_sz)
 
         self.samples = waveform_buffer
 
@@ -127,18 +136,37 @@ class OnlineAudioProcessor:
 
         """
         if self.feats is not None:
+            # 안전장치: dimension 체크
             if is_final:
-                feats = feats.narrow(1, self.trim_val, feats.size(1) - self.trim_val)
+                if feats.size(1) > self.trim_val:
+                    feats = feats.narrow(1, self.trim_val, feats.size(1) - self.trim_val)
+                else:
+                    # trim_val보다 작으면 캐시 리셋
+                    self.feats = None
+                    feats = feats.narrow(1, 0, feats.size(1))
             else:
-                feats = feats.narrow(
-                    1, self.trim_val, feats.size(1) - 2 * self.trim_val
-                )
+                if feats.size(1) > 2 * self.trim_val:
+                    feats = feats.narrow(
+                        1, self.trim_val, feats.size(1) - 2 * self.trim_val
+                    )
+                else:
+                    # 충분한 크기가 아니면 캐시 리셋
+                    self.feats = None
+                    feats = feats.narrow(1, 0, feats.size(1))
 
-            feats = torch.cat((self.feats, feats), dim=1)
+            if self.feats is not None:
+                feats = torch.cat((self.feats, feats), dim=1)
         else:
-            feats = feats.narrow(1, 0, feats.size(1) - self.trim_val)
+            if feats.size(1) > self.trim_val:
+                feats = feats.narrow(1, 0, feats.size(1) - self.trim_val)
+            else:
+                feats = feats.narrow(1, 0, feats.size(1))
 
-        self.feats = feats[:, -self.offset_frames :, :]
+        # 안전장치: offset_frames 체크
+        if feats.size(1) >= self.offset_frames:
+            self.feats = feats[:, -self.offset_frames :, :]
+        else:
+            self.feats = feats
 
         feats_length.fill_(feats.size(1))
 

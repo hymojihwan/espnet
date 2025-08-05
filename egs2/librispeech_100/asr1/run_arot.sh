@@ -9,8 +9,8 @@ train_set="train_clean_100"
 valid_set="dev"
 test_sets="test_clean test_other"
 
-asr_task="asr_ot_transducer"
-asr_config=conf/tuning/transducer/OT/conformer-rnnt-ot-streaming.yaml
+asr_task="asr_arot_transducer"
+asr_config=conf/tuning/transducer/OT/conformer-rnnt-arot-streaming.yaml
 inference_config=conf/tuning/transducer/decode_transducer.yaml
 inference_asr_model=valid.loss.ave_10best.pth
 
@@ -24,6 +24,7 @@ inference_asr_model=valid.loss.ave_10best.pth
     --max_wav_duration 30 \
     --asr_task "${asr_task}" \
     --feats_type raw \
+    --speed_perturb_factors "0.9 1.0 1.1" \
     --use_lm false \
     --asr_config "${asr_config}" \
     --inference_config "${inference_config}" \

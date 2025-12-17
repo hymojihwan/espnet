@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -548,6 +550,7 @@ def inference(
 
     # 4 .Start for-loop
     partial_latencies = []  # Store partial latencies for statistics
+    rtf_data = []  # Store RTF data for statistics
     
     with DatadirWriter(output_dir) as writer:
         for keys, batch in loader:
@@ -572,6 +575,9 @@ def inference(
                 continue
 
             try:
+                # Start timing for RTF calculation
+                inference_start_time = time.perf_counter()
+                
                 if speech2text.streaming:
                     logging.info(f"Using streaming mode for utterance {keys[0]}")
                     speech = batch["speech"]
@@ -668,7 +674,7 @@ def inference(
 
                     # 마지막 청크(is_final=True) 처리
                     try:
-                        _ = speech2text.streaming_decode(
+                        final_hyps, _ = speech2text.streaming_decode(
                             speech[(i + decoding_samples) : len(speech)], is_final=True
                         )
                     except RuntimeError as e:
@@ -681,15 +687,20 @@ def inference(
                             
                             try:
                                 speech2text.reset_streaming_cache()
-                                _ = speech2text.streaming_decode(
+                                final_hyps, _ = speech2text.streaming_decode(
                                     speech[(i + decoding_samples) : len(speech)], is_final=True
                                 )
                                 logging.info("Cache reset successful for final chunk")
                             except RuntimeError as retry_error:
                                 logging.error(f"Cache reset failed for final chunk: {retry_error}")
                                 logging.error("Skipping final chunk...")
+                                # Fallback to best from last chunk
+                                final_hyps = [best]
                         else:
                             raise e
+                    else:
+                        # If no exception, final_hyps is already set
+                        pass
 
                     # 기록
                     ibest_writer = writer["1best_recog"]
@@ -717,9 +728,6 @@ def inference(
                     else:
                         ibest_writer["latency_ms"][utt] = "nan"
                         ibest_writer["last_token_time_ms"][utt] = "nan"
-
-                    # 이제 최종 hypothesis 뽑아서 아래에서 token/text 기록
-                    final_hyps = [best]
                     
                     # utterance 완료 후 추가 메모리 정리
                     if torch.cuda.is_available():
@@ -737,7 +745,9 @@ def inference(
                     
                     # Get audio duration from batch
                     speech = batch["speech"]
-                    total_audio_duration_ms = speech.size(1) / 16000.0 * 1000.0  # milliseconds
+                    # Handle both 1D (T,) and 2D (B, T) tensors
+                    audio_samples = speech.size(-1) if speech.dim() > 0 else speech.size(0)
+                    total_audio_duration_ms = audio_samples / 16000.0 * 1000.0  # milliseconds
                     latency_ms = total_audio_duration_ms - last_token_time_ms
                     
                     ibest_writer = writer["1best_recog"]
@@ -750,6 +760,31 @@ def inference(
                     
                     # 통계를 위해 저장
                     partial_latencies.append(latency_ms)
+                
+                # End timing for RTF calculation
+                inference_end_time = time.perf_counter()
+                inference_time = inference_end_time - inference_start_time
+                
+                # Calculate RTF
+                rtf = inference_time / audio_duration if audio_duration > 0 else 0.0
+                
+                # Log RTF information
+                logging.info(
+                    f"RTF for {keys[0]}: {rtf:.4f} "
+                    f"(inference: {inference_time:.3f}s, audio: {audio_duration:.3f}s)"
+                )
+                
+                # Store RTF data
+                rtf_data.append({
+                    "utt_id": keys[0],
+                    "rtf": rtf,
+                    "inference_time_seconds": inference_time,
+                    "audio_duration_seconds": audio_duration,
+                })
+                
+                # Write RTF to output
+                ibest_writer = writer["1best_recog"]
+                ibest_writer["rtf"][keys[0]] = f"{rtf:.4f}"
 
                 results = speech2text.hypotheses_to_results(final_hyps)
 
@@ -804,6 +839,55 @@ def inference(
             f.write("\nAll latencies:\n")
             for i, lat in enumerate(latencies):
                 f.write(f"{i+1}: {lat:.2f}\n")
+    
+    # Print RTF statistics
+    if rtf_data:
+        rtfs = np.array([d["rtf"] for d in rtf_data])
+        total_audio_duration = sum(d["audio_duration_seconds"] for d in rtf_data)
+        total_inference_time = sum(d["inference_time_seconds"] for d in rtf_data)
+        overall_rtf = total_inference_time / total_audio_duration if total_audio_duration > 0 else 0.0
+        
+        logging.info("=" * 50)
+        logging.info("RTF (Real-Time Factor) STATISTICS")
+        logging.info("=" * 50)
+        logging.info(f"Number of samples: {len(rtfs)}")
+        logging.info(f"Overall RTF: {overall_rtf:.4f}")
+        logging.info(f"Mean RTF: {np.mean(rtfs):.4f}")
+        logging.info(f"Std RTF:  {np.std(rtfs):.4f}")
+        logging.info(f"Min RTF:  {np.min(rtfs):.4f}")
+        logging.info(f"Max RTF:  {np.max(rtfs):.4f}")
+        logging.info(f"25th percentile: {np.percentile(rtfs, 25):.4f}")
+        logging.info(f"50th percentile: {np.percentile(rtfs, 50):.4f}")
+        logging.info(f"75th percentile: {np.percentile(rtfs, 75):.4f}")
+        logging.info(f"Total audio duration: {total_audio_duration:.2f}s")
+        logging.info(f"Total inference time: {total_inference_time:.2f}s")
+        logging.info("=" * 50)
+        
+        # Save RTF statistics to file
+        rtf_stats_file = Path(output_dir) / "rtf_stats.txt"
+        with open(rtf_stats_file, "w") as f:
+            f.write("RTF (Real-Time Factor) STATISTICS\n")
+            f.write("=" * 50 + "\n")
+            f.write(f"Number of samples: {len(rtfs)}\n")
+            f.write(f"Overall RTF: {overall_rtf:.4f}\n")
+            f.write(f"Mean RTF: {np.mean(rtfs):.4f}\n")
+            f.write(f"Std RTF:  {np.std(rtfs):.4f}\n")
+            f.write(f"Min RTF:  {np.min(rtfs):.4f}\n")
+            f.write(f"Max RTF:  {np.max(rtfs):.4f}\n")
+            f.write(f"25th percentile: {np.percentile(rtfs, 25):.4f}\n")
+            f.write(f"50th percentile: {np.percentile(rtfs, 50):.4f}\n")
+            f.write(f"75th percentile: {np.percentile(rtfs, 75):.4f}\n")
+            f.write(f"Total audio duration: {total_audio_duration:.2f}s\n")
+            f.write(f"Total inference time: {total_inference_time:.2f}s\n")
+            f.write("=" * 50 + "\n")
+            f.write("\nAll RTF values:\n")
+            for i, d in enumerate(rtf_data):
+                f.write(f"{d['utt_id']}: {d['rtf']:.4f} (inference: {d['inference_time_seconds']:.3f}s, audio: {d['audio_duration_seconds']:.3f}s)\n")
+        
+        # Save RTF data as JSON
+        rtf_json_file = Path(output_dir) / "rtf_data.json"
+        with open(rtf_json_file, "w") as f:
+            json.dump(rtf_data, f, indent=2)
 
 
 def get_parser():

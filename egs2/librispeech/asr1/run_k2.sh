@@ -10,7 +10,7 @@ valid_set="dev"
 test_sets="test_clean test_other"
 
 asr_task="asr_transducer"
-asr_config=conf/tuning/transducer/conformer-rnnt-streaming.yaml
+asr_config=conf/tuning/transducer/conformer-rnnt-k2-streaming.yaml
 inference_config=conf/tuning/transducer/decode_transducer.yaml
 inference_asr_model=valid.loss.ave_10best.pth
 
@@ -33,4 +33,3 @@ inference_asr_model=valid.loss.ave_10best.pth
     --test_sets "${test_sets}" \
     --lm_train_text "data/${train_set}/text" \
     --bpe_train_text "data/${train_set}/text" "$@"
-

@@ -126,8 +126,6 @@ class ESPnetASRUOTTransducerModel(AbsESPnetModel):
         self.use_auxiliary_ctc = auxiliary_ctc_weight > 0
         self.use_auxiliary_lm_loss = auxiliary_lm_loss_weight > 0
 
-        self.ot_joint_linear = torch.nn.Linear(vocab_size, vocab_size)
-        self.ot_joint_norm = torch.nn.LayerNorm(vocab_size)
         self.ot_proj = torch.nn.Linear(encoder.output_size, vocab_size)
         self.ot_weight = ot_weight
         self.uot_weight = uot_weight
@@ -215,78 +213,78 @@ class ESPnetASRUOTTransducerModel(AbsESPnetModel):
         text = text[:, : text_lengths.max()]
 
         # 103-1240-0006 AS AVONLEA HOUSEKEEPERS WERE WONT TO TELL IN AWED VOICES AND KEEPING A SHARP EYE ON THE MAIN ROAD THAT CROSSED THE HOLLOW AND WOUND UP THE STEEP RED HILL BEYOND
-        target_utt = "103-1240-0006"
+        # target_utt = "103-1240-0006"
         # target_utt = "1040-133433-0017"
         # target_utt = "1034-121119-0070"
         # target_utt = "103-1240-0035"
 
-        if target_utt not in utt_id:
-            with torch.no_grad():
-                loss = torch.zeros([], device=speech.device, requires_grad=True)
-                stats = {}
-                weight = torch.ones(1, device=speech.device)
-            return loss, stats, weight
+        # if target_utt not in utt_id:
+        #     with torch.no_grad():
+        #         loss = torch.zeros([], device=speech.device, requires_grad=True)
+        #         stats = {}
+        #         weight = torch.ones(1, device=speech.device)
+        # #     return loss, stats, weight
 
-        self.eval()  
-        idx = utt_id.index(target_utt)
+        # self.eval()  
+        # idx = utt_id.index(target_utt)
 
-        with torch.no_grad():
-            # 1. Encoder
-            encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
+        # with torch.no_grad():
+        # 1. Encoder
+        encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
 
-            # 2. Transducer-related I/O preparation
-            decoder_in, target, t_len, u_len = get_transducer_task_io(
-                text,
-                encoder_out_lens,
-                ignore_id=self.ignore_id,
+        # 2. Transducer-related I/O preparation
+        decoder_in, target, t_len, u_len = get_transducer_task_io(
+            text,
+            encoder_out_lens,
+            ignore_id=self.ignore_id,
+        )
+
+        # 3. Decoder
+        self.decoder.set_device(encoder_out.device)
+        decoder_out = self.decoder(decoder_in)
+
+        # 4. Joint Network and RNNT loss computation
+        if self.use_k2_pruned_loss:
+            loss_trans = self._calc_k2_transducer_pruned_loss(
+                encoder_out, decoder_out, text, t_len, u_len, **self.k2_pruned_loss_args
+            )
+        else:
+            joint_out = self.joint_network(
+                encoder_out.unsqueeze(2), decoder_out.unsqueeze(1)
+            )
+            
+            # if self.training:
+                # 4-1. Optimal transport computation between audio encoder and prediction network outputs
+            loss_wasserstein, aligned_features = self._calc_wasserstein_loss(
+                encoder_out,
+                decoder_out,
+                epsilon=self.epsilon,
+                max_iter=self.max_iter,
+                uot_weight=self.uot_weight
             )
 
-            # 3. Decoder
-            self.decoder.set_device(encoder_out.device)
-            decoder_out = self.decoder(decoder_in)
+            ot_alignment = self.ot_proj(aligned_features)
+            ot_alignment = self.joint_network.joint_activation(ot_alignment)
+            # ot_attn_weight = torch.softmax(ot_alignment, dim=-1)
+            # 4-2. Fuse alignments between transducer and OT
+            # Step 값을 이용해 Warm-up 적용
+            lambda_ot = torch.sigmoid(self.alignment_gate) * min(1.0, self.training_step / 5000)
 
-            # 4. Joint Network and RNNT loss computation
-            if self.use_k2_pruned_loss:
-                loss_trans = self._calc_k2_transducer_pruned_loss(
-                    encoder_out, decoder_out, text, t_len, u_len, **self.k2_pruned_loss_args
-                )
-            else:
-                joint_out = self.joint_network(
-                    encoder_out.unsqueeze(2), decoder_out.unsqueeze(1)
-                )
-                
-                # if self.training:
-                    # 4-1. Optimal transport computation between audio encoder and prediction network outputs
-                loss_wasserstein, aligned_features = self._calc_wasserstein_loss(
-                    encoder_out,
-                    decoder_out,
-                    epsilon=self.epsilon,
-                    max_iter=self.max_iter,
-                    uot_weight=self.uot_weight
-                )
+            # Residual 방식으로 결합
+            joint_out = joint_out + lambda_ot * (ot_alignment - joint_out)
+            # self.extract_alignment(joint_out[idx], text[idx], t_len[idx].item(), u_len[idx].item(), target_utt)
+            # exit()
 
-                ot_alignment = self.ot_proj(aligned_features)
-                ot_alignment = self.joint_network.joint_activation(ot_alignment)
-                # ot_attn_weight = torch.softmax(ot_alignment, dim=-1)
-                # 4-2. Fuse alignments between transducer and OT
-                # Step 값을 이용해 Warm-up 적용
-                lambda_ot = torch.sigmoid(self.alignment_gate) * min(1.0, self.training_step / 5000)
-
-                # Residual 방식으로 결합
-                joint_out = joint_out + lambda_ot * (ot_alignment - joint_out)
-                self.extract_alignment(joint_out[idx], text[idx], t_len[idx].item(), u_len[idx].item(), target_utt)
-                exit()
-
-                loss_trans = self._calc_transducer_loss(
-                    encoder_out,
-                    joint_out,
-                    target,
-                    t_len,
-                    u_len,
-                )
+            loss_trans = self._calc_transducer_loss(
+                encoder_out,
+                joint_out,
+                target,
+                t_len,
+                u_len,
+            )
 
 
-        self.train()
+        # self.train()
 
         # 5. Auxiliary losses
         loss_ctc, loss_lm = 0.0, 0.0
@@ -500,8 +498,8 @@ class ESPnetASRUOTTransducerModel(AbsESPnetModel):
             feats, feats_lengths = self._extract_feats(speech, speech_lengths)
 
             # 2. Data augmentation
-            # if self.specaug is not None and self.training:
-            #     feats, feats_lengths = self.specaug(feats, feats_lengths)
+            if self.specaug is not None and self.training:
+                feats, feats_lengths = self.specaug(feats, feats_lengths)
 
             # 3. Normalization for feature: e.g. Global-CMVN, Utterance-CMVN
             if self.normalize is not None:

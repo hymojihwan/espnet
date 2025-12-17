@@ -215,15 +215,15 @@ class ESPnetASRUOTTransducerModel(AbsESPnetModel):
         encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
 
         # 103-1240-0006 AS AVONLEA HOUSEKEEPERS WERE WONT TO TELL IN AWED VOICES AND KEEPING A SHARP EYE ON THE MAIN ROAD THAT CROSSED THE HOLLOW AND WOUND UP THE STEEP RED HILL BEYOND
-        target_utt = "103-1240-0006"
-        if target_utt not in utt_id:
-            with torch.no_grad():
-                loss = torch.zeros([], device=speech.device, requires_grad=True)
-                stats = {}
-                weight = torch.ones(1, device=speech.device)
-            return loss, stats, weight
+        # target_utt = "103-1240-0006"
+        # if target_utt not in utt_id:
+        #     with torch.no_grad():
+        #         loss = torch.zeros([], device=speech.device, requires_grad=True)
+        #         stats = {}
+        #         weight = torch.ones(1, device=speech.device)
+        #     return loss, stats, weight
         
-        idx = utt_id.index(target_utt)
+        # idx = utt_id.index(target_utt)
         # 2. Transducer-related I/O preparation
         decoder_in, target, t_len, u_len = get_transducer_task_io(
             text,
@@ -245,8 +245,8 @@ class ESPnetASRUOTTransducerModel(AbsESPnetModel):
                 encoder_out.unsqueeze(2), decoder_out.unsqueeze(1)
             )
 
-            self.extract_alignment(joint_out[idx], text[idx], t_len[idx].item(), u_len[idx].item(), target_utt)
-            exit()
+            # self.extract_alignment(joint_out[idx], text[idx], t_len[idx].item(), u_len[idx].item(), target_utt)
+            # exit()
 
             if self.training:
                 # 4-1. Optimal transport computation between audio encoder and prediction network outputs
@@ -256,8 +256,8 @@ class ESPnetASRUOTTransducerModel(AbsESPnetModel):
                     epsilon=self.epsilon,
                     max_iter=self.max_iter
                 )
-                ot_alignment = self.ot_proj(aligned_features)
-                ot_alignment = self.joint_network.joint_activation(ot_alignment)
+                # ot_alignment = self.ot_proj(aligned_features)
+                # ot_alignment = self.joint_network.joint_activation(ot_alignment)
                 
             loss_trans = self._calc_transducer_loss(
                 encoder_out,
@@ -526,8 +526,8 @@ class ESPnetASRUOTTransducerModel(AbsESPnetModel):
             col_sum = torch.sum(transport_plan, dim=0)
             kl_row = torch.sum(row_sum * (torch.log(row_sum / mu) -1) + mu)
             kl_col = torch.sum(col_sum * (torch.log(col_sum / nu) -1) + nu)
-            uot_weight = random.uniform(0.0, 0.5)
-            total_wasserstein_loss += (wasserstein_loss + (uot_weight * (kl_row + kl_col)))
+            # uot_weight = random.uniform(0.0, 0.5)
+            total_wasserstein_loss += (wasserstein_loss + (self.uot_weight * (kl_row + kl_col)))
 
         total_wasserstein_loss /= batch_size
 

@@ -205,21 +205,21 @@ class ESPnetASRKDTransducerModel(AbsESPnetModel):
             == text_lengths.shape[0]
         ), (speech.shape, speech_lengths.shape, text.shape, text_lengths.shape)
 
-        with torch.no_grad():
-            self.training_step += 1
+        # with torch.no_grad():
+        #     self.training_step += 1
         batch_size = speech.shape[0]
         text = text[:, : text_lengths.max()]
 
-        target_utt = "103-1240-0006"
+        # target_utt = "103-1240-0006"
 
-        if target_utt not in utt_id:
-            with torch.no_grad():
-                loss = torch.zeros([], device=speech.device, requires_grad=True)
-                stats = {}
-                weight = torch.ones(1, device=speech.device)
-            return loss, stats, weight
-        self.eval() 
-        idx = utt_id.index(target_utt)
+        # if target_utt not in utt_id:
+        #     with torch.no_grad():
+        #         loss = torch.zeros([], device=speech.device, requires_grad=True)
+        #         stats = {}
+        #         weight = torch.ones(1, device=speech.device)
+        #     return loss, stats, weight
+        # self.eval() 
+        # idx = utt_id.index(target_utt)
 
         with torch.no_grad():
             # 1-1. Teacher Encoder
@@ -241,42 +241,42 @@ class ESPnetASRKDTransducerModel(AbsESPnetModel):
                 teacher_encoder_out.unsqueeze(2), teacher_decoder_out.unsqueeze(1)
             )
 
-        with torch.no_grad():
+        # with torch.no_grad():
 
-            # 1. Encoder
-            encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
+        # 1. Encoder
+        encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
 
-            # 2. Transducer-related I/O preparation
-            decoder_in, target, t_len, u_len = get_transducer_task_io(
-                text,
-                encoder_out_lens,
-                ignore_id=self.ignore_id,
+        # 2. Transducer-related I/O preparation
+        decoder_in, target, t_len, u_len = get_transducer_task_io(
+            text,
+            encoder_out_lens,
+            ignore_id=self.ignore_id,
+        )
+
+        # 3. Decoder
+        self.decoder.set_device(encoder_out.device)
+        decoder_out = self.decoder(decoder_in)
+
+        # 4. Joint Network and RNNT loss computation
+        if self.use_k2_pruned_loss:
+            loss_trans = self._calc_k2_transducer_pruned_loss(
+                encoder_out, decoder_out, text, t_len, u_len, **self.k2_pruned_loss_args
             )
-
-            # 3. Decoder
-            self.decoder.set_device(encoder_out.device)
-            decoder_out = self.decoder(decoder_in)
-
-            # 4. Joint Network and RNNT loss computation
-            if self.use_k2_pruned_loss:
-                loss_trans = self._calc_k2_transducer_pruned_loss(
-                    encoder_out, decoder_out, text, t_len, u_len, **self.k2_pruned_loss_args
-                )
-            else:
-                joint_out = self.joint_network(
-                    encoder_out.unsqueeze(2), decoder_out.unsqueeze(1)
-                )
-                
-                self.extract_alignment(joint_out[idx], text[idx], t_len[idx].item(), u_len[idx].item(), target_utt)
-                exit()
-                loss_trans = self._calc_transducer_loss(
-                    encoder_out,
-                    joint_out,
-                    target,
-                    t_len,
-                    u_len,
-                )
+        else:
+            joint_out = self.joint_network(
+                encoder_out.unsqueeze(2), decoder_out.unsqueeze(1)
+            )
             
+            # self.extract_alignment(joint_out[idx], text[idx], t_len[idx].item(), u_len[idx].item(), target_utt)
+            # exit()
+            loss_trans = self._calc_transducer_loss(
+                encoder_out,
+                joint_out,
+                target,
+                t_len,
+                u_len,
+            )            
+    
         # 4-1. Calculate knowledge distillation loss
         loss_kd = self._calc_kd_loss(
             joint_out,

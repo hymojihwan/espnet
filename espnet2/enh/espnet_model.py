@@ -49,6 +49,13 @@ class ESPnetEnhancementModel(AbsESPnetModel):
         categories: list = [],
         category_weights: list = [],
         always_forward_in_48k: bool = False,
+        use_text_prior: bool = False,
+        use_chunk_text_prior: bool = False,
+        text_prior_vocab_size: int = 0,
+        text_prior_embed_dim: int = 0,
+        text_prior_dropout: float = 0.0,
+        text_prior_scale: float = 1.0,
+        chunk_text_prior_blank_id: int = 0,
     ):
         """Main entry of speech enhancement/separation model training.
 
@@ -157,6 +164,37 @@ class ESPnetEnhancementModel(AbsESPnetModel):
             self.category_weights = tuple(1.0 for _ in self.categories)
 
         self.always_forward_in_48k = always_forward_in_48k
+
+        # Optional text prior conditioning
+        self.use_text_prior = use_text_prior
+        self.use_chunk_text_prior = use_chunk_text_prior
+        self.text_prior_vocab_size = text_prior_vocab_size
+        self.text_prior_scale = text_prior_scale
+        self.chunk_text_prior_blank_id = chunk_text_prior_blank_id
+        if self.use_text_prior or self.use_chunk_text_prior:
+            if self.text_prior_vocab_size <= 0:
+                raise ValueError(
+                    "text_prior_vocab_size must be > 0 when text prior is enabled"
+                )
+            embed_dim = text_prior_embed_dim or self.encoder.output_dim
+            self.text_prior_embed = torch.nn.Embedding(
+                self.text_prior_vocab_size, embed_dim
+            )
+            if embed_dim != self.encoder.output_dim:
+                self.text_prior_proj = torch.nn.Linear(
+                    embed_dim, self.encoder.output_dim
+                )
+            else:
+                self.text_prior_proj = None
+            self.text_prior_dropout = (
+                torch.nn.Dropout(text_prior_dropout)
+                if text_prior_dropout > 0
+                else None
+            )
+        else:
+            self.text_prior_embed = None
+            self.text_prior_proj = None
+            self.text_prior_dropout = None
 
     def forward(
         self,
@@ -293,6 +331,19 @@ class ESPnetEnhancementModel(AbsESPnetModel):
             ]
         if self.flexible_numspk:
             additional["num_spk"] = num_spk
+        # Optional text prior inputs for enhancement
+        if "token_int" in kwargs:
+            additional["token_int"] = kwargs.get("token_int", None)
+            additional["token_int_lengths"] = kwargs.get("token_int_lengths", None)
+            additional["token_time_ms"] = kwargs.get("token_time_ms", None)
+            additional["token_time_ms_lengths"] = kwargs.get(
+                "token_time_ms_lengths", None
+            )
+        if "token_chunk_int" in kwargs:
+            additional["token_chunk_int"] = kwargs.get("token_chunk_int", None)
+            additional["token_chunk_int_lengths"] = kwargs.get(
+                "token_chunk_int_lengths", None
+            )
         # Additional information is required in USES for multi-condition training
         if category is not None and isinstance(self.separator, USESSeparator):
             cat = self.categories[category[0].item()]
@@ -370,6 +421,30 @@ class ESPnetEnhancementModel(AbsESPnetModel):
         fs: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         feature_mix, flens = self.encoder(speech_mix, speech_lengths, fs=fs)
+        if self.use_text_prior and additional is not None:
+            prior = self._build_text_prior(
+                token_int=additional.get("token_int", None),
+                token_int_lengths=additional.get("token_int_lengths", None),
+                token_time_ms=additional.get("token_time_ms", None),
+                token_time_ms_lengths=additional.get("token_time_ms_lengths", None),
+                flens=flens,
+                speech_lengths=speech_lengths,
+                fs=fs,
+                dtype=feature_mix.dtype,
+            )
+            if prior is not None:
+                feature_mix = feature_mix + prior
+        if self.use_chunk_text_prior and additional is not None:
+            chunk_prior = self._build_chunk_text_prior(
+                token_chunk_int=additional.get("token_chunk_int", None),
+                token_chunk_int_lengths=additional.get(
+                    "token_chunk_int_lengths", None
+                ),
+                flens=flens,
+                dtype=feature_mix.dtype,
+            )
+            if chunk_prior is not None:
+                feature_mix = feature_mix + chunk_prior
         if self.mask_module is None:
             feature_pre, flens, others = self.separator(feature_mix, flens, additional)
         else:
@@ -407,6 +482,142 @@ class ESPnetEnhancementModel(AbsESPnetModel):
             # do not predict time-domain signal in the training stage
             speech_pre = None
         return speech_pre, feature_mix, feature_pre, others
+
+    def _build_text_prior(
+        self,
+        token_int: Optional[torch.Tensor],
+        token_int_lengths: Optional[torch.Tensor],
+        token_time_ms: Optional[torch.Tensor],
+        token_time_ms_lengths: Optional[torch.Tensor],
+        flens: torch.Tensor,
+        speech_lengths: torch.Tensor,
+        fs: Optional[int],
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if token_int is None or token_int_lengths is None:
+            return None
+        if token_int.numel() == 0:
+            return None
+        if fs is None:
+            fs = 16000
+
+        device = token_int.device
+        batch_size = token_int.size(0)
+        max_frames = int(flens.max().item())
+        if max_frames == 0:
+            return None
+
+        prior_ids = torch.zeros(
+            (batch_size, max_frames), dtype=torch.long, device=device
+        )
+
+        for b in range(batch_size):
+            t_len = int(flens[b].item())
+            if t_len <= 0:
+                continue
+            u_len = int(token_int_lengths[b].item())
+            if u_len <= 0:
+                continue
+
+            tokens = token_int[b, :u_len]
+
+            total_ms = (speech_lengths[b].item() / float(fs)) * 1000.0
+            if total_ms <= 0:
+                continue
+            frame_shift_ms = total_ms / float(t_len)
+
+            if token_time_ms is None or token_time_ms_lengths is None:
+                times = torch.linspace(
+                    frame_shift_ms, total_ms, steps=u_len, device=device
+                )
+            else:
+                time_len = int(token_time_ms_lengths[b].item())
+                if time_len <= 0:
+                    times = torch.linspace(
+                        frame_shift_ms, total_ms, steps=u_len, device=device
+                    )
+                else:
+                    t_use = min(u_len, time_len)
+                    times = token_time_ms[b, :t_use].to(device=device)
+                    tokens = tokens[:t_use]
+                    if t_use < u_len:
+                        tokens = tokens[:t_use]
+
+            times = torch.clamp(times, min=0.0, max=total_ms)
+            frame_times = (
+                torch.arange(1, t_len + 1, device=device, dtype=times.dtype)
+                * frame_shift_ms
+            )
+            idx = torch.bucketize(frame_times, times, right=True) - 1
+            idx = torch.clamp(idx, min=-1, max=tokens.numel() - 1)
+            valid = idx >= 0
+            prior_ids[b, :t_len][valid] = tokens[idx[valid]]
+
+        prior = self.text_prior_embed(prior_ids)
+        if self.text_prior_proj is not None:
+            prior = self.text_prior_proj(prior)
+        if self.text_prior_dropout is not None:
+            prior = self.text_prior_dropout(prior)
+        prior = prior.to(dtype=dtype)
+        prior = prior * float(self.text_prior_scale)
+        return prior
+
+    def _build_chunk_text_prior(
+        self,
+        token_chunk_int: Optional[torch.Tensor],
+        token_chunk_int_lengths: Optional[torch.Tensor],
+        flens: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if token_chunk_int is None or token_chunk_int_lengths is None:
+            return None
+        if token_chunk_int.numel() == 0:
+            return None
+
+        device = token_chunk_int.device
+        batch_size = token_chunk_int.size(0)
+        max_frames = int(flens.max().item())
+        if max_frames == 0:
+            return None
+
+        max_chunks = int(token_chunk_int.size(1))
+        chunk_size = max_frames // max_chunks if max_chunks > 0 else 0
+        if chunk_size <= 0:
+            return None
+
+        prior_ids = torch.zeros(
+            (batch_size, max_frames), dtype=torch.long, device=device
+        )
+
+        for b in range(batch_size):
+            t_len = int(flens[b].item())
+            if t_len <= 0:
+                continue
+            c_len = int(token_chunk_int_lengths[b].item())
+            if c_len <= 0:
+                continue
+            c_len = min(c_len, max_chunks)
+            tokens = token_chunk_int[b, :c_len]
+
+            # Use previous chunk token as prior for current chunk
+            for c in range(1, c_len):
+                tok = int(tokens[c - 1].item())
+                if tok == self.chunk_text_prior_blank_id:
+                    continue
+                start = c * chunk_size
+                end = min((c + 1) * chunk_size, t_len)
+                if start >= t_len:
+                    break
+                prior_ids[b, start:end] = tok
+
+        prior = self.text_prior_embed(prior_ids)
+        if self.text_prior_proj is not None:
+            prior = self.text_prior_proj(prior)
+        if self.text_prior_dropout is not None:
+            prior = self.text_prior_dropout(prior)
+        prior = prior.to(dtype=dtype)
+        prior = prior * float(self.text_prior_scale)
+        return prior
 
     def forward_loss(
         self,

@@ -737,7 +737,7 @@ def inference(
                     
                     # Get audio duration from batch
                     speech = batch["speech"]
-                    total_audio_duration_ms = speech.size(1) / 16000.0 * 1000.0  # milliseconds
+                    total_audio_duration_ms = speech.shape[-1] / 16000.0 * 1000.0  # milliseconds
                     latency_ms = total_audio_duration_ms - last_token_time_ms
                     
                     ibest_writer = writer["1best_recog"]

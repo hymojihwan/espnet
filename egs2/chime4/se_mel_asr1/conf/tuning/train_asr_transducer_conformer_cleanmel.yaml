@@ -1,0 +1,80 @@
+# Conformer Transducer for clean-mel extracted features
+batch_type: numel
+batch_bins: 4800000
+accum_grad: 16
+max_epoch: 100
+patience: none
+init: none
+num_att_plot: 0
+
+val_scheduler_criterion:
+  - valid
+  - loss
+best_model_criterion:
+  - - valid
+    - loss
+    - min
+keep_nbest_models: 10
+
+model_conf:
+  transducer_weight: 1.0
+  auxiliary_ctc_weight: 0.0
+  report_cer: true
+  report_wer: true
+
+encoder: contextual_block_conformer
+encoder_conf:
+  block_size: 40
+  hop_size: 16
+  look_ahead: 16
+  init_average: true
+  main_conf:
+    pos_wise_act_type: swish
+    conv_mod_act_type: swish
+    pos_enc_dropout_rate: 0.1
+    dynamic_chunk_training: false
+    short_chunk_threshold: 0.75
+    short_chunk_size: 25
+    num_left_chunks: -1
+  input_conf:
+    vgg_like: true
+  body_conf:
+    - block_type: conformer
+      hidden_size: 256
+      linear_size: 1024
+      heads: 4
+      dropout_rate: 0.1
+      pos_wise_dropout_rate: 0.1
+      att_dropout_rate: 0.1
+      conv_mod_kernel_size: 31
+      num_blocks: 12
+
+decoder: rnn
+decoder_conf:
+  rnn_type: lstm
+  num_layers: 1
+  embed_size: 256
+  hidden_size: 256
+  dropout_rate: 0.1
+  embed_dropout_rate: 0.1
+
+joint_network_conf:
+  joint_space_size: 256
+
+frontend: null
+normalize: utterance_mvn
+normalize_conf: {}
+specaug: null
+specaug_conf: {}
+
+optim: adam
+optim_conf:
+  lr: 0.0005
+  weight_decay: 0.0001
+scheduler: warmuplr
+scheduler_conf:
+  warmup_steps: 3000
+
+seed: 0
+use_amp: true
+num_workers: 4

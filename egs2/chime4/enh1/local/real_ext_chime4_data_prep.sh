@@ -30,6 +30,17 @@ dir=`pwd`/data/local/data
 mkdir -p $dir
 local=`pwd`/local
 utils=`pwd`/utils
+# Path to mix-mono-wav-scp.py (recipe utils or repo root utils)
+mix_py="${utils}/mix-mono-wav-scp.py"
+if [ ! -f "$mix_py" ]; then
+  _srcdir="$(cd "$(dirname "$0")" && pwd)"
+  [ -f "${_srcdir}/../../../../utils/mix-mono-wav-scp.py" ] && mix_py="${_srcdir}/../../../../utils/mix-mono-wav-scp.py"
+fi
+# Recipe utils for .pl scripts (utt2spk_to_spk2utt.pl); fallback to egs2/TEMPLATE/asr1/utils
+if [ ! -f "${utils}/utt2spk_to_spk2utt.pl" ]; then
+  _srcdir="$(cd "$(dirname "$0")" && pwd)"
+  [ -f "${_srcdir}/../../../TEMPLATE/asr1/utils/utt2spk_to_spk2utt.pl" ] && utils="${_srcdir}/../../../TEMPLATE/asr1/utils"
+fi
 odir=`pwd`/data
 
 if [[ "$track" == "2" ]]; then
@@ -108,7 +119,7 @@ elif [[ "$track" == "6" ]]; then
 
   for x in $list_set; do
     sed -E "s#${audio_dir}/(.*)\.CH1.wav#${audio_dir}/\1.CH0.wav#g" ${x}_wav.CH1.scp > ${x}_spk1_wav.scp
-    mix-mono-wav-scp.py ${x}_wav.CH{1,3,4,5,6}.scp > ${x}_wav.scp
+    python "$mix_py" ${x}_wav.CH{1,3,4,5,6}.scp > ${x}_wav.scp
   done
 fi
 

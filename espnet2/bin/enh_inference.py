@@ -304,14 +304,23 @@ class SeparateSpeech:
                     [batch_size], dtype=torch.long, fill_value=T
                 )
                 # b. Enhancement/Separation Forward
-                feats, f_lens = self.enh_model.encoder(speech_seg, lengths_seg, fs=fs_)
-                if isinstance(self.enh_model, ESPnetDiffusionModel):
-                    feats = [self.enh_model.enhance(feats)]
+                use_ot_frontend = getattr(self.enh_model, "use_asr_ot_frontend", False)
+                use_ot_frontend = use_ot_frontend or hasattr(self.enh_model, "se_model")
+                if use_ot_frontend:
+                    processed_wav, _, _, _ = self.enh_model.forward_enhance(
+                        speech_seg, lengths_seg, additional=additional, fs=fs_
+                    )
                 else:
-                    feats, _, _ = self.enh_model.separator(feats, f_lens, additional)
-                processed_wav = [
-                    self.enh_model.decoder(f, lengths_seg, fs=fs_)[0] for f in feats
-                ]
+                    feats, f_lens = self.enh_model.encoder(
+                        speech_seg, lengths_seg, fs=fs_
+                    )
+                    if isinstance(self.enh_model, ESPnetDiffusionModel):
+                        feats = [self.enh_model.enhance(feats)]
+                    else:
+                        feats, _, _ = self.enh_model.separator(feats, f_lens, additional)
+                    processed_wav = [
+                        self.enh_model.decoder(f, lengths_seg, fs=fs_)[0] for f in feats
+                    ]
                 if speech_seg.dim() > 2:
                     # multi-channel speech
                     speech_seg_ = speech_seg[:, self.ref_channel]
@@ -364,12 +373,19 @@ class SeparateSpeech:
             waves = torch.unbind(waves, dim=0)
         else:
             # b. Enhancement/Separation Forward
-            feats, f_lens = self.enh_model.encoder(speech_mix, lengths, fs=fs_)
-            if isinstance(self.enh_model, ESPnetDiffusionModel):
-                feats = [self.enh_model.enhance(feats)]
+            use_ot_frontend = getattr(self.enh_model, "use_asr_ot_frontend", False)
+            use_ot_frontend = use_ot_frontend or hasattr(self.enh_model, "se_model")
+            if use_ot_frontend:
+                waves, _, _, _ = self.enh_model.forward_enhance(
+                    speech_mix, lengths, additional=additional, fs=fs_
+                )
             else:
-                feats, _, _ = self.enh_model.separator(feats, f_lens, additional)
-            waves = [self.enh_model.decoder(f, lengths, fs=fs_)[0] for f in feats]
+                feats, f_lens = self.enh_model.encoder(speech_mix, lengths, fs=fs_)
+                if isinstance(self.enh_model, ESPnetDiffusionModel):
+                    feats = [self.enh_model.enhance(feats)]
+                else:
+                    feats, _, _ = self.enh_model.separator(feats, f_lens, additional)
+                waves = [self.enh_model.decoder(f, lengths, fs=fs_)[0] for f in feats]
 
         ###################################
         # De-normalize the signal variance

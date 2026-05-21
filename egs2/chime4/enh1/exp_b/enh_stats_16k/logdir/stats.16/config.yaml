@@ -1,0 +1,202 @@
+config: conf/tuning/train_enh_conv_tasnet.yaml
+print_config: false
+log_level: INFO
+drop_last_iter: false
+dry_run: false
+iterator_type: chunk
+valid_iterator_type: null
+output_dir: exp/enh_stats_16k/logdir/stats.16
+ngpu: 0
+seed: 0
+num_workers: 4
+num_att_plot: 3
+dist_backend: nccl
+dist_init_method: env://
+dist_world_size: null
+dist_rank: null
+local_rank: null
+dist_master_addr: null
+dist_master_port: null
+dist_launcher: null
+multiprocessing_distributed: false
+unused_parameters: false
+sharded_ddp: false
+use_deepspeed: false
+deepspeed_config: null
+cudnn_enabled: true
+cudnn_benchmark: false
+cudnn_deterministic: true
+use_tf32: false
+collect_stats: true
+write_collected_feats: false
+max_epoch: 100
+patience: 10
+val_scheduler_criterion:
+- valid
+- loss
+early_stopping_criterion:
+- valid
+- loss
+- min
+best_model_criterion:
+-   - valid
+    - si_snr
+    - max
+-   - valid
+    - loss
+    - min
+keep_nbest_models: 1
+nbest_averaging_interval: 0
+grad_clip: 5.0
+grad_clip_type: 2.0
+grad_noise: false
+accum_grad: 1
+no_forward_run: false
+resume: false
+train_dtype: float32
+use_amp: false
+log_interval: null
+use_matplotlib: true
+use_tensorboard: true
+create_graph_in_tensorboard: false
+use_wandb: false
+wandb_project: null
+wandb_id: null
+wandb_entity: null
+wandb_name: null
+wandb_model_log_interval: -1
+detect_anomaly: false
+use_adapter: false
+adapter: lora
+save_strategy: all
+adapter_conf: {}
+pretrain_path: null
+init_param: []
+ignore_init_mismatch: false
+freeze_param: []
+num_iters_per_epoch: null
+batch_size: 32
+valid_batch_size: null
+batch_bins: 1000000
+valid_batch_bins: null
+category_sample_size: 10
+train_shape_file:
+- exp/enh_stats_16k/logdir/train.16.scp
+valid_shape_file:
+- exp/enh_stats_16k/logdir/valid.16.scp
+batch_type: folded
+valid_batch_type: null
+fold_length: []
+sort_in_batch: descending
+shuffle_within_batch: false
+sort_batch: descending
+multiple_iterator: false
+chunk_length: 32000
+chunk_shift_ratio: 0.5
+num_cache_chunks: 1024
+chunk_excluded_key_prefixes: []
+chunk_default_fs: null
+chunk_max_abs_length: null
+chunk_discard_short_samples: true
+train_data_path_and_name_and_type:
+-   - dump/raw/tr05_simu_isolated_1ch_track/wav.scp
+    - speech_mix
+    - sound
+-   - dump/raw/tr05_simu_isolated_1ch_track/spk1.scp
+    - speech_ref1
+    - sound
+valid_data_path_and_name_and_type:
+-   - dump/raw/dt05_simu_isolated_1ch_track/wav.scp
+    - speech_mix
+    - sound
+-   - dump/raw/dt05_simu_isolated_1ch_track/spk1.scp
+    - speech_ref1
+    - sound
+multi_task_dataset: false
+allow_variable_data_keys: false
+max_cache_size: 0.0
+max_cache_fd: 32
+allow_multi_rates: false
+valid_max_cache_size: null
+exclude_weight_decay: false
+exclude_weight_decay_conf: {}
+optim: adam
+optim_conf:
+    lr: 0.001
+    eps: 1.0e-08
+    weight_decay: 1.0e-05
+scheduler: reducelronplateau
+scheduler_conf:
+    mode: min
+    factor: 0.5
+    patience: 5
+init: xavier_uniform
+model_conf:
+    stft_consistency: false
+    loss_type: mask_mse
+    mask_type: null
+    flexible_numspk: false
+    extract_feats_in_collect_stats: false
+    normalize_variance: false
+    normalize_variance_per_ch: false
+    categories: []
+    category_weights: []
+    always_forward_in_48k: false
+criterions:
+-   name: si_snr
+    conf:
+        eps: 1.0e-07
+    wrapper: fixed_order
+    wrapper_conf:
+        weight: 1.0
+speech_volume_normalize: null
+rir_scp: null
+rir_apply_prob: 1.0
+noise_scp: null
+noise_apply_prob: 1.0
+noise_db_range: '13_15'
+short_noise_thres: 0.5
+use_reverberant_ref: false
+num_spk: 1
+num_noise_type: 1
+sample_rate: 8000
+force_single_channel: false
+channel_reordering: false
+categories: []
+speech_segment: null
+avoid_allzero_segment: true
+flexible_numspk: false
+dynamic_mixing: false
+utt2spk: null
+dynamic_mixing_gain_db: 0.0
+encoder: conv
+encoder_conf:
+    channel: 256
+    kernel_size: 20
+    stride: 10
+separator: tcn
+separator_conf:
+    num_spk: 1
+    layer: 8
+    stack: 4
+    bottleneck_dim: 256
+    hidden_dim: 512
+    kernel: 3
+    causal: false
+    norm_type: gLN
+    nonlinear: relu
+decoder: conv
+decoder_conf:
+    channel: 256
+    kernel_size: 20
+    stride: 10
+mask_module: multi_mask
+mask_module_conf: {}
+preprocessor: null
+preprocessor_conf: {}
+diffusion_model: null
+diffusion_model_conf: {}
+required:
+- output_dir
+version: '202412'
+distributed: false

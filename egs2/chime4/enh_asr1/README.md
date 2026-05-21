@@ -1,5 +1,35 @@
 # MultiIRIS (WPD-beamformer-Enh, WavLM_Large + SpecAug + Conformer-ASR with Transformer-LM)
 
+## Frozen enh (enh1 Conv-TasNet) + Conformer CTC (`enh_s2t`)
+
+End-to-end recipe (official ESPnet2 `EnhS2TTask`): load a pretrained **enhancement** model, **freeze** it, train only **Conformer CTC** on the enhanced waveform.
+
+- **Config:** `conf/tuning/train_enh_s2t_frozen_enh_conformer_ctc.yaml`  
+  - `model_conf.enh_frontend_no_grad: true`, `calc_enh_loss: false`  
+  - Enh architecture matches `../enh1/conf/tuning/train_enh_conv_tasnet.yaml` (`separator: tcn`).
+- **Run:** `./run_enh_s2t_frozen_enh_ctc.sh`  
+  - Default checkpoint: `../enh1/exp/enh_train_enh_conv_tasnet_raw/valid.loss.ave_1best.pth` (override with `ENH_PRETRAINED=...`).  
+  - Passes `--init_param '...::enh_model'` and `--freeze_param enh_model`.  
+  - Reuses BPE from `../asr1/data/en_token_list/bpe_unigram1024` by default (`TOKEN_DIR=...` to change).
+
+Prerequisite: `./local/data.sh` (or `LOCAL_DATA_OPTS=...`), and ASR1 BPE files if you use thedefault `TOKEN_DIR`.
+
+## Same data pipeline as `../asr1/run_ctc.sh` (recommended)
+
+`local/data.sh` matches **asr1** CHiME4 prep: copy the same directory list from `../enh1/data`, rewrite `wav.scp` / `spk1.scp` / `noise1.scp` (absolute paths + `.CH2`–`.CH6` → `.CH1`), add `text_spk1` / `utt2lang`, and build `data/nlsyms.txt` like **run_ctc.sh**.
+
+- **`./run_from_enh1.sh`** — runs `local/data.sh` if needed, then **`enh_asr.sh`** with the same defaults as **run_ctc** where applicable: **BPE 1024**, **speed perturb 0.9/1.0/1.1**, **flac**, **`use_lm false`**, **`feats_normalize global_mvn`**.
+
+- First-time corpus prep (optional, same as `../asr1/local/data_enh1_style.sh`):
+
+  `LOCAL_DATA_OPTS='--extra-annotations /path/to/annotations --stage 1 --stop_stage 2' ./run_from_enh1.sh`
+
+  For `--extra-annotations`, set **CHIME3/CHIME4** in `db.sh` (e.g. `ln -sf ../asr1/db.sh db.sh` in this dir instead of the TEMPLATE `db.sh` symlink).
+
+- Override enh1 data location only:
+
+  `./local/data.sh --enh1-data-root /abs/path/to/enh1/data`
+
 ## Notes
 - Joint finetuning requires pre-trained Enh and ASR models.
 - `local/run_multiiris.sh` performs (1) pre-training of the Enh model, (2) pre-training of the ASR model, and (3) joint finetuning of the entire system.

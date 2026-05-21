@@ -1,0 +1,11 @@
+[
+  {
+    "epoch": 23,
+    "train_time_seconds": 425.48410880798474,
+    "valid_time_seconds": 26.86493127909489,
+    "total_time_seconds": 452.34931308799423,
+    "train_time_formatted": "7 minutes and 5.48 seconds",
+    "valid_time_formatted": "26.86 seconds",
+    "total_time_formatted": "7 minutes and 32.35 seconds"
+  }
+]

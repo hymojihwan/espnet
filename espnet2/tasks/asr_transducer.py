@@ -10,9 +10,18 @@ from typeguard import typechecked
 
 from espnet2.asr.frontend.abs_frontend import AbsFrontend
 from espnet2.asr.frontend.default import DefaultFrontend
+from espnet2.asr.frontend.frozen_enh import FrozenEnhFrontend
+from espnet2.asr.frontend.frozen_enh_latent import FrozenEnhLatentFrontend
 from espnet2.asr.frontend.windowing import SlidingWindow
 from espnet2.asr.specaug.abs_specaug import AbsSpecAug
 from espnet2.asr.specaug.specaug import SpecAug
+from espnet2.asr_transducer.espnet_dual_transducer_model import (
+    ESPnetASRDualTransducerModel,
+    TransformerLowerPredictor,
+)
+from espnet2.asr_transducer.espnet_se_jepa_transducer_model import (
+    ESPnetASRSEJEPATransducerModel,
+)
 from espnet2.asr_transducer.decoder.abs_decoder import AbsDecoder
 from espnet2.asr_transducer.decoder.mega_decoder import MEGADecoder
 from espnet2.asr_transducer.decoder.rnn_decoder import RNNDecoder
@@ -26,6 +35,7 @@ from espnet2.layers.global_mvn import GlobalMVN
 from espnet2.layers.utterance_mvn import UtteranceMVN
 from espnet2.tasks.abs_task import AbsTask
 from espnet2.text.phoneme_tokenizer import g2p_choices
+from espnet2.train.abs_espnet_model import AbsESPnetModel
 from espnet2.train.class_choices import ClassChoices
 from espnet2.train.collate_fn import CommonCollateFn
 from espnet2.train.preprocessor import CommonPreprocessor
@@ -34,10 +44,22 @@ from espnet2.utils.get_default_kwargs import get_default_kwargs
 from espnet2.utils.nested_dict_action import NestedDictAction
 from espnet2.utils.types import float_or_none, int_or_none, str2bool, str_or_none
 
+model_choices = ClassChoices(
+    "model",
+    classes=dict(
+        espnet=ESPnetASRTransducerModel,
+        dual=ESPnetASRDualTransducerModel,
+        se_jepa=ESPnetASRSEJEPATransducerModel,
+    ),
+    type_check=AbsESPnetModel,
+    default="espnet",
+)
 frontend_choices = ClassChoices(
     name="frontend",
     classes=dict(
         default=DefaultFrontend,
+        frozen_enh=FrozenEnhFrontend,
+        frozen_enh_latent=FrozenEnhLatentFrontend,
         sliding_window=SlidingWindow,
     ),
     type_check=AbsFrontend,
@@ -81,6 +103,7 @@ class ASRTransducerTask(AbsTask):
     num_optimizers: int = 1
 
     class_choices_list = [
+        model_choices,
         frontend_choices,
         specaug_choices,
         normalize_choices,
@@ -122,6 +145,13 @@ class ASRTransducerTask(AbsTask):
             help="Type of model initialization to use.",
         )
         group.add_argument(
+            "--model",
+            type=str,
+            default="espnet",
+            choices=list(model_choices.classes),
+            help="Model architecture to use.",
+        )
+        group.add_argument(
             "--model_conf",
             action=NestedDictAction,
             default=get_default_kwargs(ESPnetASRTransducerModel),
@@ -138,6 +168,37 @@ class ASRTransducerTask(AbsTask):
             action=NestedDictAction,
             default={},
             help="The keyword arguments for the joint network class.",
+        )
+        group.add_argument(
+            "--lower_predictor_type",
+            type=str,
+            default="rnn",
+            choices=["rnn", "transformer"],
+            help="Architecture for the lower text-to-clean-mel predictor.",
+        )
+        group.add_argument(
+            "--lower_decoder_conf",
+            action=NestedDictAction,
+            default={},
+            help="Keyword arguments for the lower predictor module.",
+        )
+        group.add_argument(
+            "--lower_predictor_conf",
+            action=NestedDictAction,
+            default={},
+            help="Keyword arguments for the transformer lower predictor module.",
+        )
+        group.add_argument(
+            "--lower_joint_network_conf",
+            action=NestedDictAction,
+            default={},
+            help="Keyword arguments for the lower prior joint module.",
+        )
+        group.add_argument(
+            "--upper_encoder_conf",
+            action=NestedDictAction,
+            default={},
+            help="Keyword arguments for the upper acoustic encoder adapter.",
         )
 
         group = parser.add_argument_group(description="Preprocess related.")
@@ -216,10 +277,7 @@ class ASRTransducerTask(AbsTask):
             default="13_15",
             help="The range of the noise decibel level.",
         )
-
-        for class_choices in cls.class_choices_list:
-            # Append --<name> and --<name>_conf.
-            # e.g. --decoder and --decoder_conf
+        for class_choices in [frontend_choices, specaug_choices, normalize_choices, decoder_choices]:
             class_choices.add_arguments(group)
 
     @classmethod
@@ -325,7 +383,10 @@ class ASRTransducerTask(AbsTask):
             retval: Optional task data.
 
         """
-        retval = ()
+        if inference:
+            retval = ()
+        else:
+            retval = ("speech_ref1", "clean_speech")
 
         return retval
 
@@ -359,6 +420,18 @@ class ASRTransducerTask(AbsTask):
             args.model_conf["warmup_steps"] = args.scheduler_conf.get(
                 "warmup_steps", 25000
             )
+        if not hasattr(args, "model"):
+            args.model = "espnet"
+        if not hasattr(args, "lower_predictor_type"):
+            args.lower_predictor_type = "rnn"
+        if not hasattr(args, "lower_decoder_conf"):
+            args.lower_decoder_conf = {}
+        if not hasattr(args, "lower_predictor_conf"):
+            args.lower_predictor_conf = {}
+        if not hasattr(args, "lower_joint_network_conf"):
+            args.lower_joint_network_conf = {}
+        if not hasattr(args, "upper_encoder_conf"):
+            args.upper_encoder_conf = {}
 
         logging.info(f"Vocabulary size: {vocab_size }")
 
@@ -400,26 +473,108 @@ class ASRTransducerTask(AbsTask):
         )
         decoder_output_size = decoder.output_size
 
-        # 6. Joint Network
-        joint_network = JointNetwork(
-            vocab_size,
-            encoder_output_size,
-            decoder_output_size,
-            **args.joint_network_conf,
-        )
+        model_class = model_choices.get_class(args.model)
 
-        # 7. Build model
-        model = ESPnetASRTransducerModel(
-            vocab_size=vocab_size,
-            token_list=token_list,
-            frontend=frontend,
-            specaug=specaug,
-            normalize=normalize,
-            encoder=encoder,
-            decoder=decoder,
-            joint_network=joint_network,
-            **args.model_conf,
-        )
+        if args.model == "dual":
+            upper_encoder_type = args.model_conf.get("upper_encoder_type", "transducer")
+            lower_mel_dim = args.model_conf.get("lower_mel_dim", 80)
+
+            if upper_encoder_type == "identity":
+                upper_encoder_output_size = encoder_output_size
+            elif upper_encoder_type == "linear":
+                upper_encoder_output_size = args.upper_encoder_conf.get(
+                    "output_size", encoder_output_size
+                )
+            elif upper_encoder_type == "transducer":
+                upper_encoder_output_size = Encoder(
+                    lower_mel_dim, **args.upper_encoder_conf
+                ).output_size
+            else:
+                raise ValueError(f"Unsupported upper_encoder_type: {upper_encoder_type}")
+
+            joint_network = JointNetwork(
+                vocab_size,
+                upper_encoder_output_size,
+                decoder_output_size,
+                **args.joint_network_conf,
+            )
+
+            if args.lower_predictor_type == "transformer":
+                lower_predictor_conf = (
+                    args.lower_predictor_conf
+                    if args.lower_predictor_conf
+                    else args.lower_decoder_conf
+                )
+                lower_decoder = TransformerLowerPredictor(
+                    vocab_size,
+                    **lower_predictor_conf,
+                )
+            else:
+                lower_decoder_conf = (
+                    args.lower_decoder_conf if args.lower_decoder_conf else args.decoder_conf
+                )
+                lower_decoder = decoder_class(
+                    vocab_size,
+                    **lower_decoder_conf,
+                )
+            lower_joint_network = JointNetwork(
+                encoder_output_size,
+                encoder_output_size,
+                lower_decoder.output_size,
+                **args.lower_joint_network_conf,
+            )
+            model = model_class(
+                vocab_size=vocab_size,
+                token_list=token_list,
+                frontend=frontend,
+                specaug=specaug,
+                normalize=normalize,
+                encoder=encoder,
+                decoder=decoder,
+                joint_network=joint_network,
+                lower_decoder=lower_decoder,
+                lower_joint_network=lower_joint_network,
+                upper_encoder_conf=args.upper_encoder_conf,
+                **args.model_conf,
+            )
+        elif args.model == "se_jepa":
+            joint_network = JointNetwork(
+                vocab_size,
+                encoder_output_size,
+                decoder_output_size,
+                **args.joint_network_conf,
+            )
+            model = model_class(
+                vocab_size=vocab_size,
+                token_list=token_list,
+                frontend=frontend,
+                specaug=specaug,
+                normalize=normalize,
+                encoder=encoder,
+                decoder=decoder,
+                joint_network=joint_network,
+                input_size=input_size,
+                **args.model_conf,
+            )
+        else:
+            # 6. Joint Network
+            joint_network = JointNetwork(
+                vocab_size,
+                encoder_output_size,
+                decoder_output_size,
+                **args.joint_network_conf,
+            )
+            model = model_class(
+                vocab_size=vocab_size,
+                token_list=token_list,
+                frontend=frontend,
+                specaug=specaug,
+                normalize=normalize,
+                encoder=encoder,
+                decoder=decoder,
+                joint_network=joint_network,
+                **args.model_conf,
+            )
 
         # 8. Initialize model
         if args.init is not None:

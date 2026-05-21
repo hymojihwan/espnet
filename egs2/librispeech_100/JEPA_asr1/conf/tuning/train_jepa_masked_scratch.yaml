@@ -1,0 +1,114 @@
+# JEPA Masked-Patch Inpainting Frontend for CTC ASR (from scratch)
+# This configuration uses JEPA masked-patch inpainting that predicts masked regions
+# Architecture: Mask patches → Context encoder (unmasked noisy) → Predictor → Decoder → Reconstruct masked patches
+
+# general
+batch_type: numel
+batch_bins: 24000000
+accum_grad: 16
+max_epoch: 200
+patience: none
+init: none  # No pretrained model initialization
+best_model_criterion:
+-   - valid
+    - wer_ctc
+    - min
+keep_nbest_models: 10
+
+# JEPA Masked-Patch Frontend configuration
+# Outputs denoised log-mel features (80-dim, same as baseline)
+frontend: jepa_masked
+frontend_conf:
+    # Architecture parameters
+    embedding_dim: 256
+    context_encoder_dim: 256
+    target_encoder_dim: 256
+    predictor_dim: 256
+    decoder_dim: 256
+    num_context_encoder_layers: 2
+    num_target_encoder_layers: 2
+    num_predictor_layers: 2
+    num_decoder_layers: 2
+    # Patch configuration
+    patch_size: [4, 4]  # (time, freq) patches
+    mask_ratio: 0.3  # Mask 30% of patches
+    # Audio processing parameters (same as baseline)
+    n_fft: 512
+    hop_length: 128
+    win_length: 512
+    fs: 16000
+    n_mels: 80  # Output dimension (log-mel)
+    # Training parameters
+    embedding_loss_weight: 1.0  # Reconstruction loss weight
+    ema_decay: 0.999  # EMA decay rate for target encoder
+    dropout_rate: 0.1
+
+# Pre-encoder: Not needed - JEPA masked frontend outputs 80-dim log-mel directly
+preencoder: null
+preencoder_conf: {}
+
+# Encoder: Conformer (trained from scratch, same as standard CTC)
+encoder: conformer
+encoder_conf:
+    output_size: 256
+    attention_heads: 4
+    linear_units: 1024
+    num_blocks: 18
+    dropout_rate: 0.1
+    positional_dropout_rate: 0.1
+    attention_dropout_rate: 0.1
+    input_layer: conv2d
+    normalize_before: true
+    macaron_style: true
+    rel_pos_type: latest
+    pos_enc_layer_type: rel_pos
+    selfattention_layer_type: rel_selfattn
+    activation_type: swish
+    use_cnn_module: true
+    cnn_module_kernel: 31
+
+# CTC model configuration (standard CTC, no progressive schedule needed)
+model_conf:
+    ctc_weight: 1.0
+    lsm_weight: 0.1
+    length_normalized_loss: false
+    report_cer: True
+    report_wer: True
+
+# Decoder: None (CTC-only mode)
+decoder: null
+decoder_conf: {}
+
+# optimizer (same as standard CTC training)
+optim: adam
+optim_conf:
+    lr: 0.002  # Standard learning rate (same as train_conformer_ctc.yaml)
+    weight_decay: 0.000001
+scheduler: warmuplr
+scheduler_conf:
+    warmup_steps: 15000  # Standard warmup steps (same as train_conformer_ctc.yaml)
+
+num_att_plot: 0
+
+# SpecAugment: Enabled (can use specaug with masked patch denoiser)
+specaug: specaug
+specaug_conf:
+    apply_time_warp: true
+    time_warp_window: 5
+    time_warp_mode: bicubic
+    apply_freq_mask: true
+    freq_mask_width_range:
+    - 0
+    - 27
+    num_freq_mask: 2
+    apply_time_mask: true
+    time_mask_width_ratio_range:
+    - 0.
+    - 0.05
+    num_time_mask: 5
+
+# Normalization: Use global MVN (same as standard CTC training)
+normalize: global_mvn
+normalize_conf:
+    stats_file: exp/asr_stats_raw_en_bpe2048/train/feats_stats.npz
+

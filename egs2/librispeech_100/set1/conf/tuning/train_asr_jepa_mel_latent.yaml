@@ -1,0 +1,93 @@
+unused_parameters: false
+
+encoder: conformer
+encoder_conf:
+    output_size: 256
+    attention_heads: 4
+    linear_units: 1024
+    num_blocks: 12
+    dropout_rate: 0.1
+    positional_dropout_rate: 0.1
+    attention_dropout_rate: 0.1
+    input_layer: conv2d
+    normalize_before: true
+    macaron_style: true
+    rel_pos_type: latest
+    pos_enc_layer_type: rel_pos
+    selfattention_layer_type: rel_selfattn
+    activation_type: swish
+    use_cnn_module: true
+    cnn_module_kernel: 31
+
+decoder: transducer
+decoder_conf:
+    rnn_type: lstm
+    num_layers: 1
+    hidden_size: 512
+    dropout: 0.1
+    dropout_embed: 0.2
+
+frontend: jepa_mel_latent
+frontend_conf:
+    output_dim: 256
+    embedding_dim: 256
+    predictor_dim: 512
+    num_predictor_layers: 2
+    dropout_rate: 0.1
+    mask_ratio: 0.30
+    ema_decay: 0.999
+    embedding_loss_weight: 0.3
+    var_loss_weight: 0.05
+    cov_loss_weight: 0.005
+    loss_type: l2
+    min_mask_frames: 12
+    min_num_mask_blocks: 2
+    max_num_mask_blocks: 4
+    n_fft: 512
+    win_length: 400
+    hop_length: 160
+    n_mels: 80
+
+model: jepa_espnet
+model_conf:
+    ctc_weight: 0.0
+    lsm_weight: 0.1
+    length_normalized_loss: false
+    ctc_weight_start: 0.01
+    ctc_weight_end: 1.0
+    ctc_weight_warmup_steps: 60000
+
+joint_net_conf:
+    joint_space_size: 512
+
+seed: 2022
+log_interval: null
+num_att_plot: 0
+num_workers: 4
+sort_in_batch: descending
+sort_batch: descending
+batch_type: numel
+batch_bins: 4400000
+accum_grad: 16
+max_epoch: 70
+patience: none
+init: none
+best_model_criterion:
+-   - valid
+    - acc
+    - max
+keep_nbest_models: 10
+
+use_amp: false
+cudnn_deterministic: false
+cudnn_benchmark: false
+
+optim: adam
+optim_conf:
+    lr: 0.0005
+    weight_decay: 0.000001
+scheduler: warmuplr
+scheduler_conf:
+    warmup_steps: 25000
+
+specaug: null

@@ -202,6 +202,15 @@ def main():
             "'ID ID-CH0.wav ID-CH1.wav'"
         ),
     )
+    parser.add_argument(
+        "--skip-bad-files",
+        type=str2bool,
+        default=False,
+        help=(
+            "If true, skip missing or unreadable WAV entries with a warning "
+            "instead of raising an error."
+        ),
+    )
     args = parser.parse_args()
 
     out_num_samples = Path(args.outdir) / "utt2num_samples"
@@ -272,19 +281,27 @@ def main():
 
                     # B.b Without segments and not using pipe
                     else:
-                        if args.multi_columns_input:
-                            wave, rate, subtypes = soundfile_read(
-                                wavs=wavpath.split(),
-                                dtype=None,
-                                always_2d=False,
-                                concat_axis=1,
-                                return_subtype=True,
-                            )
-                        else:
-                            with soundfile.SoundFile(wavpath) as sf:
-                                rate = sf.samplerate
-                                subtypes = [sf.subtype]
-                                wave = sf.read()
+                        try:
+                            if args.multi_columns_input:
+                                wave, rate, subtypes = soundfile_read(
+                                    wavs=wavpath.split(),
+                                    dtype=None,
+                                    always_2d=False,
+                                    concat_axis=1,
+                                    return_subtype=True,
+                                )
+                            else:
+                                with soundfile.SoundFile(wavpath) as sf:
+                                    rate = sf.samplerate
+                                    subtypes = [sf.subtype]
+                                    wave = sf.read()
+                        except (OSError, soundfile.LibsndfileError) as e:
+                            if args.skip_bad_files:
+                                logging.warning(
+                                    "Skipping %s: %s (%s)", uttid, wavpath, e
+                                )
+                                continue
+                            raise
                     yield uttid, (wave, rate), wavpath, subtypes
 
     with out_num_samples.open("w") as fnum_samples:

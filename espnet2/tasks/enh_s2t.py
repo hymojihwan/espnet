@@ -142,6 +142,7 @@ asr_attributes = [
     "decoder",
     "decoder_conf",
     "ctc_conf",
+    "joint_net_conf",
 ]
 
 st_attributes = [
@@ -291,6 +292,12 @@ class EnhS2TTask(AbsTask):
             action=NestedDictAction,
             default=get_default_kwargs(CTC),
             help="The keyword arguments for CTC class.",
+        )
+        group.add_argument(
+            "--joint_net_conf",
+            action=NestedDictAction,
+            default=None,
+            help="The keyword arguments for joint network class.",
         )
 
         group.add_argument(

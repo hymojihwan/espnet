@@ -15,9 +15,9 @@ import torch
 from packaging.version import parse as V
 from typeguard import typechecked
 
-from espnet2.asr_transducer.beam_search_transducer import (
-    BeamSearchTransducer,
-    Hypothesis,
+from espnet2.asr_transducer.beam_search_transducer import BeamSearchTransducer, Hypothesis
+from espnet2.asr_transducer.dual_beam_search_transducer import (
+    DualBeamSearchTransducer,
 )
 from espnet2.asr_transducer.frontend.online_audio_processor import OnlineAudioProcessor
 from espnet2.asr_transducer.utils import TooShortUttError
@@ -140,15 +140,39 @@ class Speech2Text:
         if beam_search_config is None:
             beam_search_config = {}
 
-        beam_search = BeamSearchTransducer(
-            asr_model.decoder,
-            asr_model.joint_network,
-            beam_size,
-            lm=lm_scorer,
-            lm_weight=lm_weight,
-            nbest=nbest,
-            **beam_search_config,
-        )
+        if hasattr(asr_model, "encode_with_prefix_features"):
+            def prefix_refiner(yseq):
+                prefix = torch.tensor([yseq], device=device, dtype=torch.long)
+                refined_enc_out, _ = asr_model.encode_with_prefix_features(
+                    feats_cache["feats"],
+                    feats_cache["feats_lengths"],
+                    prefix,
+                )
+                return refined_enc_out[0]
+
+            feats_cache = {}
+            beam_search = DualBeamSearchTransducer(
+                asr_model.decoder,
+                asr_model.joint_network,
+                beam_size,
+                prefix_refiner=prefix_refiner,
+                lm=lm_scorer,
+                lm_weight=lm_weight,
+                nbest=nbest,
+                **beam_search_config,
+            )
+            self._dual_feats_cache = feats_cache
+        else:
+            beam_search = BeamSearchTransducer(
+                asr_model.decoder,
+                asr_model.joint_network,
+                beam_size,
+                lm=lm_scorer,
+                lm_weight=lm_weight,
+                nbest=nbest,
+                **beam_search_config,
+            )
+            self._dual_feats_cache = None
 
         token_list = asr_model.token_list
 
@@ -275,6 +299,10 @@ class Speech2Text:
         if self.asr_model.normalize is not None:
             feats, feats_length = self.asr_model.normalize(feats, feats_length)
 
+        if self._dual_feats_cache is not None:
+            self._dual_feats_cache["feats"] = feats
+            self._dual_feats_cache["feats_lengths"] = feats_length
+
         enc_out, _ = self.asr_model.encoder(feats, feats_length)
 
         nbest_hyps = self.beam_search(enc_out[0])
@@ -318,62 +346,28 @@ class Speech2Text:
         """
         if len(token_int) == 0:
             return 0.0
-            
-        try:
-            # 실제 beam search 과정에서 마지막 토큰 emit 시점 추적
-            T = enc_out.size(0)
-            last_emit_frame = 0
-            
-            # 각 frame에서 마지막 토큰이 emit되는지 확인
-            for t in range(T):
-                # 현재 frame에서의 encoder 출력
-                current_enc = enc_out[t:t+1]  # (1, D)
-                
-                # 마지막 토큰이 현재 frame에서 emit되는지 확인
-                last_token = token_int[-1]
-                
-                # Decoder 시퀀스 생성 (blank + 모든 토큰들)
-                decoder_seq = [0] + token_int
-                decoder_input = torch.tensor([decoder_seq], dtype=torch.long, device=self.device)
-                decoder_out = self.asr_model.decoder(decoder_input)
-                
-                # Joint network 계산
-                joint = self.asr_model.joint_network(
-                    current_enc.unsqueeze(1).unsqueeze(2),  # (1, 1, 1, D)
-                    decoder_out.unsqueeze(1)  # (1, 1, U, D)
-                )
-                
-                # 마지막 decoder step에서 마지막 토큰의 확률 확인
-                if joint.dim() == 4:
-                    joint = joint.squeeze(0).squeeze(0)  # (1, V)
-                elif joint.dim() == 3:
-                    joint = joint.squeeze(0)  # (1, V)
-                
-                probs = torch.softmax(joint, dim=-1)
-                last_token_prob = probs[0, last_token].item()
-                
-                # 높은 확률로 마지막 토큰이 emit되는지 확인
-                if last_token_prob > 0.5:  # 임계값
-                    last_emit_frame = t
-                    break
-            
-            # frame -> ms 변환
-            hop = self.asr_model.encoder.embed.subsampling_factor * self.asr_model.frontend.hop_length
-            sr = 16000
-            last_time_ms = last_emit_frame * hop / sr * 1000.0
-            
-            logging.debug(f"Token sequence: {token_int}")
-            logging.debug(f"Last token: {last_token}, Last emit frame: {last_emit_frame}, Last time ms: {last_time_ms:.1f}")
-            
-            return last_time_ms
-            
-        except Exception as e:
-            # logging.warning(f"Error in calculate_partial_latency: {e}")
-            # 에러 발생 시 기본값 반환
-            hop = self.asr_model.encoder.embed.subsampling_factor * self.asr_model.frontend.hop_length
-            sr = 16000
-            last_time_ms = (enc_out.size(0) - 1) * hop / sr * 1000.0
-            return last_time_ms
+
+        # Robust approximation: map the emitted token count to the encoder time axis.
+        # This avoids shape-coupling issues with custom frontends during decoding.
+        if enc_out.dim() >= 1:
+            total_frames = int(enc_out.size(0))
+        else:
+            total_frames = 1
+
+        # Use frontend hop if available; otherwise fallback to default 10 ms frame shift.
+        frontend_hop = getattr(getattr(self, "asr_model", None), "frontend", None)
+        hop_length = getattr(frontend_hop, "hop_length", 160)
+
+        # Subsampling factor can differ by encoder; fallback to 4 if unavailable.
+        embed = getattr(getattr(self.asr_model, "encoder", None), "embed", None)
+        subsampling_factor = getattr(embed, "subsampling_factor", 4)
+
+        sr = 16000
+        token_ratio = min(1.0, max(0.0, float(len(token_int)) / max(1, total_frames)))
+        last_emit_frame = max(0, int(round((total_frames - 1) * token_ratio)))
+        last_time_ms = last_emit_frame * (hop_length * subsampling_factor) / sr * 1000.0
+
+        return float(last_time_ms)
 
     @staticmethod
     def from_pretrained(
@@ -439,6 +433,8 @@ def inference(
     display_hypotheses: bool,
     min_duration: float,
     max_duration: float,
+    dump_token_time: bool = False,
+    dump_chunk_token: bool = False,
 ) -> None:
     """Transducer model inference.
 
@@ -474,6 +470,7 @@ def inference(
         display_hypotheses: Whether to display (partial and full) hypotheses.
         min_duration: Minimum duration in seconds. Audio shorter than this will be skipped.
         max_duration: Maximum duration in seconds. Audio longer than this will be skipped.
+        dump_token_time: Whether to dump per-token emission time (ms).
 
     """
 
@@ -595,6 +592,8 @@ def inference(
                     last_token_emit_time_ms = 0.0
                     accumulated_frames = 0
                     previous_token_count = 0
+                    token_time_ms_list = []
+                    chunk_token_ids = []
                     
                     for i in range(0, len(speech), decoding_samples):
                         chunk = speech[i : i + decoding_samples]
@@ -658,6 +657,15 @@ def inference(
                             last_token_emit_time_ms = previous_time_ms + last_token_time_ms
                             
                             logging.debug(f"Chunk {chunk_idx}: new tokens emitted, frames={frames_in_chunk}, tokens={cur_len}, emit_time={last_token_emit_time_ms:.1f}ms")
+                            new_count = cur_len - previous_token_count
+                            if new_count > 0:
+                                token_time_ms_list.extend(
+                                    [last_token_emit_time_ms] * new_count
+                                )
+                                if dump_chunk_token:
+                                    chunk_token_ids.append(token_int[-1])
+                        elif dump_chunk_token:
+                            chunk_token_ids.append(0)
                         
                         previous_token_count = cur_len
                         
@@ -717,6 +725,32 @@ def inference(
                     else:
                         ibest_writer["latency_ms"][utt] = "nan"
                         ibest_writer["last_token_time_ms"][utt] = "nan"
+                    
+                    # Ensure token_time_ms length matches final token sequence
+                    if dump_token_time:
+                        final_token_int = [
+                            t
+                            for t in best.yseq
+                            if t
+                            not in (0, speech2text.asr_model.ignore_id)
+                        ]
+                        if len(token_time_ms_list) < len(final_token_int):
+                            pad_time = (
+                                last_token_emit_time_ms
+                                if last_token_emit_time_ms > 0
+                                else total_audio_duration_ms
+                            )
+                            token_time_ms_list.extend(
+                                [pad_time] * (len(final_token_int) - len(token_time_ms_list))
+                            )
+                        token_time_ms_str = " ".join(
+                            [f"{t:.1f}" for t in token_time_ms_list[: len(final_token_int)]]
+                        )
+                        ibest_writer["token_time_ms"][utt] = token_time_ms_str
+                    if dump_chunk_token:
+                        ibest_writer["token_chunk_int"][utt] = " ".join(
+                            map(str, chunk_token_ids)
+                        )
 
                     # 이제 최종 hypothesis 뽑아서 아래에서 token/text 기록
                     final_hyps = [best]
@@ -737,7 +771,7 @@ def inference(
                     
                     # Get audio duration from batch
                     speech = batch["speech"]
-                    total_audio_duration_ms = speech.size(1) / 16000.0 * 1000.0  # milliseconds
+                    total_audio_duration_ms = speech.shape[-1] / 16000.0 * 1000.0  # milliseconds
                     latency_ms = total_audio_duration_ms - last_token_time_ms
                     
                     ibest_writer = writer["1best_recog"]
@@ -750,6 +784,23 @@ def inference(
                     
                     # 통계를 위해 저장
                     partial_latencies.append(latency_ms)
+                    
+                    if dump_token_time:
+                        if len(token_int) > 0:
+                            token_time_ms_list = np.linspace(
+                                total_audio_duration_ms / len(token_int),
+                                total_audio_duration_ms,
+                                num=len(token_int),
+                            )
+                            token_time_ms_str = " ".join(
+                                [f"{t:.1f}" for t in token_time_ms_list]
+                            )
+                        else:
+                            token_time_ms_str = ""
+                        ibest_writer["token_time_ms"][keys[0]] = token_time_ms_str
+                    if dump_chunk_token:
+                        # Non-streaming: no chunk tokens by default
+                        ibest_writer["token_chunk_int"][keys[0]] = ""
 
                 results = speech2text.hypotheses_to_results(final_hyps)
 
@@ -823,6 +874,18 @@ def get_parser():
     )
 
     parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument(
+        "--dump_token_time",
+        type=str2bool,
+        default=False,
+        help="If true, dump per-token emission time (ms) to token_time_ms.",
+    )
+    parser.add_argument(
+        "--dump_chunk_token",
+        type=str2bool,
+        default=False,
+        help="If true, dump per-chunk token id to token_chunk_int.",
+    )
     parser.add_argument(
         "--ngpu",
         type=int,

@@ -21,6 +21,30 @@ min() {
   echo "${a}"
 }
 
+find_clean_speech_scp() {
+    local dset=$1
+    if [ -f "${dset}/clean_speech.scp" ]; then
+        echo "${dset}/clean_speech.scp"
+    elif [ -f "${dset}/clean_wav.scp" ]; then
+        echo "${dset}/clean_wav.scp"
+    else
+        echo ""
+    fi
+}
+
+clean_speech_data_type() {
+    local scp_path=$1
+    local default_type=$2
+    case "$(basename "${scp_path}")" in
+        clean_wav.scp)
+            echo "sound"
+            ;;
+        *)
+            echo "${default_type}"
+            ;;
+    esac
+}
+
 SECONDS=0
 
 # General configuration
@@ -55,6 +79,7 @@ feats_type=raw       # Feature type (raw, raw_copy, fbank_pitch, or extracted).
 audio_format=flac    # Audio format: wav, flac, wav.ark, flac.ark  (only in feats_type=raw).
 multi_columns_input_wav_scp=false  # Enable multi columns mode for input wav.scp for format_wav_scp.py
 multi_columns_output_wav_scp=false # Enable multi columns mode for output wav.scp for format_wav_scp.py
+format_wav_scp_skip_bad_files=false # If true, skip missing/corrupt files in format_wav_scp.py instead of failing.
 fs=16k               # Sampling rate.
 min_wav_duration=0.1 # Minimum duration in second.
 max_wav_duration=20  # Maximum duration in second.
@@ -135,9 +160,9 @@ inference_tag=    # Suffix to the result dir for decoding.
 inference_config= # Config for decoding.
 inference_args=   # Arguments for decoding, e.g., "--lm_weight 0.1".
                   # Note that it will overwrite args in inference config.
-inference_lm=valid.loss.ave.pth       # Language model path for decoding.
+inference_lm=valid.loss.ave_10best.pth       # Language model path for decoding.
 inference_ngram=${ngram_num}gram.bin
-inference_asr_model=valid.acc.ave.pth # ASR model path for decoding.
+inference_asr_model=valid.loss.ave_10best.pth # ASR model path for decoding.
                                       # e.g.
                                       # inference_asr_model=train.loss.best.pth
                                       # inference_asr_model=3epoch.pth
@@ -652,7 +677,20 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ] && ! [[ " ${skip_stages} " =~ [
                 --audio-format "${audio_format}" --fs "${fs}" ${_opts} \
                 --multi-columns-input "${multi_columns_input_wav_scp}" \
                 --multi-columns-output "${multi_columns_output_wav_scp}" \
+                --skip-bad-files "${format_wav_scp_skip_bad_files}" \
                 "data/${dset}/wav.scp" "${data_feats}${_suf}/${dset}"
+
+            if "${format_wav_scp_skip_bad_files}"; then
+                utils/fix_data_dir.sh "${data_feats}${_suf}/${dset}"
+            fi
+
+            for clean_scp in clean_wav.scp clean_speech.scp; do
+                if [ -f "data/${dset}/${clean_scp}" ]; then
+                    <"data/${dset}/${clean_scp}" \
+                        utils/filter_scp.pl "${data_feats}${_suf}/${dset}/wav.scp" \
+                        >"${data_feats}${_suf}/${dset}/${clean_scp}"
+                fi
+            done
 
             echo "${feats_type}" > "${data_feats}${_suf}/${dset}/feats_type"
             if "${multi_columns_output_wav_scp}"; then
@@ -698,6 +736,10 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ] && ! [[ " ${skip_stages} " =~ [
                     [ -f data/${dset}/${ref_txt} ] && cp data/${dset}/${ref_txt} ${data_feats}${_suf}/${dset}
                 done
             fi
+
+            for clean_scp in clean_wav.scp clean_speech.scp; do
+                [ -f "data/${dset}/${clean_scp}" ] && cp "data/${dset}/${clean_scp}" "${data_feats}${_suf}/${dset}/${clean_scp}"
+            done
 
             echo "raw" > "${data_feats}${_suf}/${dset}/feats_type"
             if "${multi_columns_input_wav_scp}"; then
@@ -768,6 +810,9 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ] && ! [[ " ${skip_stages} " =~ [
                 fi
             fi
             utils/copy_data_dir.sh --validate_opts --non-print data/"${dset}" "${data_feats}${_suf}/${dset}"
+            for clean_scp in clean_wav.scp clean_speech.scp; do
+                [ -f data/${dset}/${clean_scp} ] && cp data/${dset}/${clean_scp} "${data_feats}${_suf}/${dset}/${clean_scp}"
+            done
 
             # Copy reference text files if there is more than 1 reference
             # shellcheck disable=SC2068
@@ -820,6 +865,13 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ] && ! [[ " ${skip_stages} " =~ [
             <"${data_feats}/org/${dset}/wav.scp" \
                 utils/filter_scp.pl "${data_feats}/${dset}/utt2num_samples"  \
                 >"${data_feats}/${dset}/wav.scp"
+            for clean_scp in clean_wav.scp clean_speech.scp; do
+                if [ -f "${data_feats}/org/${dset}/${clean_scp}" ]; then
+                    <"${data_feats}/org/${dset}/${clean_scp}" \
+                        utils/filter_scp.pl "${data_feats}/${dset}/utt2num_samples" \
+                        >"${data_feats}/${dset}/${clean_scp}"
+                fi
+            done
         else
             # Get frame shift in ms from conf/fbank.conf
             _frame_shift=
@@ -844,6 +896,13 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ] && ! [[ " ${skip_stages} " =~ [
             <"${data_feats}/org/${dset}/feats.scp" \
                 utils/filter_scp.pl "${data_feats}/${dset}/feats_shape"  \
                 >"${data_feats}/${dset}/feats.scp"
+            for clean_scp in clean_wav.scp clean_speech.scp; do
+                if [ -f "${data_feats}/org/${dset}/${clean_scp}" ]; then
+                    <"${data_feats}/org/${dset}/${clean_scp}" \
+                        utils/filter_scp.pl "${data_feats}/${dset}/feats_shape" \
+                        >"${data_feats}/${dset}/${clean_scp}"
+                fi
+            done
         fi
 
         # Remove empty text
@@ -854,8 +913,14 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ] && ! [[ " ${skip_stages} " =~ [
         done
 
         # fix_data_dir.sh leaves only utts which exist in all files
+        _extra_utt_files="${ref_text_files_str}"
+        for clean_scp in clean_wav.scp clean_speech.scp; do
+            if [ -f "${data_feats}/${dset}/${clean_scp}" ]; then
+                _extra_utt_files="${_extra_utt_files:+${_extra_utt_files} }${clean_scp}"
+            fi
+        done
         utils/fix_data_dir.sh \
-            ${ref_text_files_str:+--utt_extra_files "${ref_text_files_str}"} \
+            ${_extra_utt_files:+--utt_extra_files "${_extra_utt_files}"} \
             "${data_feats}/${dset}"
     done
 
@@ -1248,6 +1313,18 @@ if [ ${stage} -le 10 ] && [ ${stop_stage} -ge 10 ] && ! [[ " ${skip_stages} " =~
 
     _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/${_scp},speech,${_type} "
     _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/${_scp},speech,${_type} "
+    if [ "${asr_task}" = "asr_jepa" ] || [ "${asr_task}" = "asr_transducer" ]; then
+        _clean_train_scp="$(find_clean_speech_scp "${_asr_train_dir}")"
+        _clean_valid_scp="$(find_clean_speech_scp "${_asr_valid_dir}")"
+        if [ -n "${_clean_train_scp}" ]; then
+            _clean_train_type="$(clean_speech_data_type "${_clean_train_scp}" "${_type}")"
+            _opts+="--train_data_path_and_name_and_type ${_clean_train_scp},clean_speech,${_clean_train_type} "
+        fi
+        if [ -n "${_clean_valid_scp}" ]; then
+            _clean_valid_type="$(clean_speech_data_type "${_clean_valid_scp}" "${_type}")"
+            _opts+="--valid_data_path_and_name_and_type ${_clean_valid_scp},clean_speech,${_clean_valid_type} "
+        fi
+    fi
     # shellcheck disable=SC2068
     for i in ${!ref_text_files[@]}; do
         _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/${ref_text_files[$i]},${ref_text_names[$i]},text "
@@ -1364,6 +1441,23 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
 
         _opts+="--train_data_path_and_name_and_type ${_split_dir}/${_scp},speech,${_type} "
         _opts+="--train_shape_file ${_split_dir}/speech_shape "
+        if [ "${asr_task}" = "asr_jepa" ] || [ "${asr_task}" = "asr_transducer" ]; then
+            _clean_train_scp="$(find_clean_speech_scp "${_asr_train_dir}")"
+        else
+            _clean_train_scp=""
+        fi
+        if [ -n "${_clean_train_scp}" ]; then
+            _clean_basename="$(basename "${_clean_train_scp}")"
+            if [ ! -f "${_split_dir}/${_clean_basename}.done" ]; then
+                ${python} -m espnet2.bin.split_scps \
+                    --scps "${_clean_train_scp}" \
+                    --num_splits "${num_splits_asr}" \
+                    --output_dir "${_split_dir}"
+                touch "${_split_dir}/${_clean_basename}.done"
+            fi
+            _clean_train_type="$(clean_speech_data_type "${_clean_train_scp}" "${_type}")"
+            _opts+="--train_data_path_and_name_and_type ${_split_dir}/${_clean_basename},clean_speech,${_clean_train_type} "
+        fi
         # shellcheck disable=SC2068
         for i in ${!ref_text_names[@]}; do
             _opts+="--fold_length ${asr_text_fold_length} "
@@ -1375,6 +1469,13 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
     else
         _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/${_scp},speech,${_type} "
         _opts+="--train_shape_file ${asr_stats_dir}/train/speech_shape "
+        if [ "${asr_task}" = "asr_jepa" ] || [ "${asr_task}" = "asr_transducer" ]; then
+            _clean_train_scp="$(find_clean_speech_scp "${_asr_train_dir}")"
+            if [ -n "${_clean_train_scp}" ]; then
+                _clean_train_type="$(clean_speech_data_type "${_clean_train_scp}" "${_type}")"
+                _opts+="--train_data_path_and_name_and_type ${_clean_train_scp},clean_speech,${_clean_train_type} "
+            fi
+        fi
 
         read -r -a aux_list <<< "$auxiliary_data_tags"
         if [ ${#aux_list[@]} != 0 ]; then
@@ -1391,6 +1492,13 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
         done
     fi
 
+    if [ "${asr_task}" = "asr_jepa" ] || [ "${asr_task}" = "asr_transducer" ]; then
+        _clean_valid_scp="$(find_clean_speech_scp "${_asr_valid_dir}")"
+        if [ -n "${_clean_valid_scp}" ]; then
+            _clean_valid_type="$(clean_speech_data_type "${_clean_valid_scp}" "${_type}")"
+            _opts+="--valid_data_path_and_name_and_type ${_clean_valid_scp},clean_speech,${_clean_valid_type} "
+        fi
+    fi
     # shellcheck disable=SC2068
     for i in ${!ref_text_names[@]}; do
         _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/${ref_text_files[$i]},${ref_text_names[$i]},text "

@@ -1,0 +1,134 @@
+# Stage 1: pretrain the lower dual-transducer on clean-mel supervision only
+model: dual
+
+batch_type: numel
+batch_bins: 1800000
+accum_grad: 4
+max_epoch: 60
+patience: none
+init: none
+num_att_plot: 0
+
+val_scheduler_criterion:
+  - valid
+  - loss
+best_model_criterion:
+  - - valid
+    - loss
+    - min
+keep_nbest_models: 10
+
+model_conf:
+  training_stage: lower
+  freeze_upper: true
+  transducer_weight: 0.0
+  auxiliary_ctc_weight: 0.0
+  report_cer: false
+  report_wer: false
+  upper_encoder_type: transducer
+  lower_aggregator_type: softmax
+  lower_prior_dropout_rate: 0.1
+  lower_gate_hidden_size: 256
+  lower_gate_dropout_rate: 0.1
+  lower_gate_bias_init: 0.0
+  lower_text_decoder_num_layers: 2
+  lower_text_decoder_num_heads: 4
+  lower_text_decoder_linear_size: 1024
+  lower_text_decoder_dropout_rate: 0.1
+  lower_fusion_hidden_size: 256
+  lower_fusion_dropout_rate: 0.1
+  lower_mel_dim: 80
+  lower_mel_loss_weight: 1.0
+  lower_mel_loss_type: l1
+  lower_mel_acoustic_weight: 1.0
+  lower_mel_text_weight: 0.5
+  lower_mel_fused_weight: 1.0
+  lower_gate_reg_weight: 0.0
+
+encoder_conf:
+  main_conf:
+    pos_wise_act_type: swish
+    conv_mod_act_type: swish
+    pos_enc_dropout_rate: 0.1
+    dynamic_chunk_training: false
+    short_chunk_threshold: 0.75
+    short_chunk_size: 25
+    num_left_chunks: -1
+  input_conf:
+    vgg_like: true
+  body_conf:
+    - block_type: conformer
+      hidden_size: 256
+      linear_size: 1024
+      heads: 4
+      dropout_rate: 0.1
+      pos_wise_dropout_rate: 0.1
+      att_dropout_rate: 0.1
+      conv_mod_kernel_size: 31
+      num_blocks: 8
+
+decoder: rnn
+decoder_conf:
+  rnn_type: lstm
+  num_layers: 1
+  embed_size: 256
+  hidden_size: 256
+  dropout_rate: 0.1
+  embed_dropout_rate: 0.1
+
+lower_predictor_type: transformer
+lower_predictor_conf:
+  hidden_size: 256
+  num_layers: 4
+  num_heads: 4
+  linear_size: 1024
+  dropout_rate: 0.1
+  positional_dropout_rate: 0.1
+  max_len: 1024
+
+joint_network_conf:
+  joint_space_size: 256
+
+lower_joint_network_conf:
+  joint_space_size: 256
+  joint_activation_type: tanh
+
+upper_encoder_conf:
+  main_conf:
+    pos_wise_act_type: swish
+    conv_mod_act_type: swish
+    pos_enc_dropout_rate: 0.1
+    dynamic_chunk_training: false
+    short_chunk_threshold: 0.75
+    short_chunk_size: 25
+    num_left_chunks: -1
+  input_conf:
+    vgg_like: true
+  body_conf:
+    - block_type: conformer
+      hidden_size: 256
+      linear_size: 1024
+      heads: 4
+      dropout_rate: 0.1
+      pos_wise_dropout_rate: 0.1
+      att_dropout_rate: 0.1
+      conv_mod_kernel_size: 31
+      num_blocks: 8
+
+frontend: default
+specaug: null
+specaug_conf: {}
+normalize: utterance_mvn
+normalize_conf: {}
+
+seed: 2022
+use_amp: false
+num_workers: 2
+
+optim: adam
+optim_conf:
+  lr: 0.0005
+  weight_decay: 0.000001
+scheduler: warmuplr
+scheduler_conf:
+  warmup_steps: 3000

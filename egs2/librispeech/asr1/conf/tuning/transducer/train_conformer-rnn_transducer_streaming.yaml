@@ -1,0 +1,84 @@
+# The conformer transducer training configuration
+# WERs for test-clean/test-other are 2.8 and 6.6, respectively.
+# Trained with RTX A6000(48GB) x 4 GPUs. It takes about 6 days.
+batch_type: numel
+batch_bins: 4400000
+accum_grad: 18
+max_epoch: 50
+patience: none
+init: none
+num_att_plot: 0
+
+val_scheduler_criterion:
+    - valid
+    - loss
+best_model_criterion:
+-   - valid
+    - loss
+    - min
+keep_nbest_models: 10
+
+model_conf:
+    transducer_weight: 1.0
+    auxiliary_ctc_weight: 0.0
+    report_cer: True
+    report_wer: True
+
+encoder_conf:
+  main_conf:
+    pos_wise_act_type: swish
+    conv_mod_act_type: swish
+    pos_enc_dropout_rate: 0.2
+    dynamic_chunk_training: True  # Enable dynamic chunk training for streaming
+    short_chunk_threshold: 0.75
+    short_chunk_size: 25
+    num_left_chunks: 4
+  input_conf:
+    vgg_like: True
+  body_conf:
+  - block_type: conformer
+    linear_size: 2048
+    hidden_size: 512
+    heads: 8
+    dropout_rate: 0.1
+    pos_wise_dropout_rate: 0.1
+    att_dropout_rate: 0.1
+    conv_mod_kernel_size: 31
+    num_blocks: 12
+
+decoder: rnn
+decoder_conf:
+    rnn_type: lstm
+    num_layers: 1
+    embed_size: 512
+    hidden_size: 512
+    dropout_rate: 0.1
+    embed_dropout_rate: 0.2
+
+joint_network_conf:
+    joint_space_size: 512
+
+optim: adam
+optim_conf:
+    lr: 0.0015
+    weight_decay: 0.000001
+scheduler: warmuplr
+scheduler_conf:
+    warmup_steps: 25000
+
+# specaug conf
+specaug: specaug
+specaug_conf:
+    apply_time_warp: true
+    time_warp_window: 5
+    time_warp_mode: bicubic
+    apply_freq_mask: true
+    freq_mask_width_range:
+    - 0
+    - 27
+    num_freq_mask: 2
+    apply_time_mask: true
+    time_mask_width_ratio_range:
+    - 0.0
+    - 0.05
+    num_time_mask: 10

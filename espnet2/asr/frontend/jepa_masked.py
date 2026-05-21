@@ -1,0 +1,845 @@
+
+"""JEPA Masked-Patch Inpainting Frontend for ASR.
+
+This module implements a JEPA-style masked-patch inpainting denoiser that
+predicts masked regions of log-mel spectrograms.
+"""
+
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_complex.tensor import ComplexTensor
+
+from espnet2.asr.frontend.abs_frontend import AbsFrontend
+from espnet2.layers.log_mel import LogMel
+from espnet2.layers.stft import Stft
+from espnet.nets.pytorch_backend.transformer.attention import MultiHeadedAttention
+from espnet.nets.pytorch_backend.transformer.embedding import PositionalEncoding
+from espnet.nets.pytorch_backend.transformer.encoder_layer import EncoderLayer
+from espnet.nets.pytorch_backend.transformer.layer_norm import LayerNorm
+from espnet.nets.pytorch_backend.transformer.positionwise_feed_forward import (
+    PositionwiseFeedForward,
+)
+from espnet.nets.pytorch_backend.transformer.repeat import repeat
+
+class JEPA_MaskedPatchFrontend(AbsFrontend):
+    """JEPA Masked-Patch Inpainting Frontend for ASR.
+
+    This frontend implements a JEPA-style masked-patch inpainting denoiser
+    that predicts masked regions of log-mel spectrograms.
+
+    Architecture:
+        Noisy Speech → STFT → Log-Mel (x_n) → Mask patches
+                                                      ↓
+        Unmasked patches → Context Encoder → Context Features
+                                                      ↓
+                                                 Predictor
+                                                      ↓
+        Clean Speech → STFT → Log-Mel (x_c) → Target Encoder (EMA) → Target Latents
+                                                      ↓
+                                                 (for masked regions)
+                                                      ↓
+                                                 Decoder → Reconstructed patches
+                                                      ↓
+        Merge: unmasked from x_n, masked from reconstruction → x_hat
+                                                      ↓
+        Feed x_hat to Conformer-CTC
+
+    During training:
+        - Mask patches on noisy log-mel (x_n)
+        - Context encoder processes unmasked noisy patches
+        - Target encoder (EMA) processes clean log-mel (x_c)
+        - Predictor predicts target latents for masked regions
+        - Decoder reconstructs mel patches from latents
+        - Loss: MSE between reconstructed and clean patches (masked regions only)
+
+    During inference:
+        - Only noisy speech is used
+        - Predictor and decoder reconstruct masked patches
+        - Merged features (x_hat) are fed to encoder
+
+    Args:
+        output_dim: Output dimension of the frontend (should match encoder input, e.g., 80 for log-mel)
+        embedding_dim: Dimension of the embedding/latent space (default: 256)
+        context_encoder_dim: Dimension of the context encoder hidden layers (default: 256)
+        target_encoder_dim: Dimension of the target encoder hidden layers (default: 256)
+        predictor_dim: Dimension of the predictor hidden layers (default: 256)
+        decoder_dim: Dimension of the decoder hidden layers (default: 256)
+        num_context_encoder_layers: Number of context encoder layers (default: 2)
+        num_target_encoder_layers: Number of target encoder layers (default: 2)
+        num_predictor_layers: Number of predictor layers (default: 2)
+        num_decoder_layers: Number of decoder layers (default: 2)
+        patch_size: Size of patches in (time, freq) dimensions (default: (4, 4))
+        mask_ratio: Ratio of patches to mask (default: 0.3)
+        dropout_rate: Dropout rate (default: 0.1)
+        n_fft: FFT size for STFT (default: 512)
+        hop_length: Hop length for STFT (default: 128)
+        win_length: Window length for STFT (default: None, defaults to n_fft)
+        fs: Sampling rate (default: 16000)
+        n_mels: Number of mel bins (default: 80)
+        embedding_loss_weight: Weight for the reconstruction loss (default: 1.0)
+        ema_decay: EMA decay rate for target encoder updates (default: 0.999)
+        window: Window function for STFT (default: "hann")
+        center: Whether to center STFT frames (default: True)
+        normalized: Whether to normalize STFT (default: False)
+        onesided: Whether to return onesided STFT (default: True)
+    """
+
+    def __init__(
+        self,
+        output_dim: int = 80,  # Output dimension of the frontend (log-mel dim)
+        embedding_dim: int = 256,
+        context_encoder_dim: int = 256,
+        target_encoder_dim: int = 256,
+        predictor_dim: int = 256,
+        decoder_dim: int = 256,
+        num_context_encoder_layers: int = 2,
+        num_target_encoder_layers: int = 2,
+        num_predictor_layers: int = 2,
+        num_decoder_layers: int = 2,
+        patch_size: Any = (4, 4),  # (time, freq) - can accept list/tuple from YAML
+        mask_ratio: float = 0.3,
+        dropout_rate: float = 0.1,
+        encoder_type: str = "mlp",  # "mlp" or "transformer"
+        encoder_conf: Optional[Dict[str, Any]] = None,
+        predictor_type: str = "mlp",  # "mlp" or "transformer"
+        predictor_conf: Optional[Dict[str, Any]] = None,
+        decoder_type: str = "mlp",  # "mlp" or "transformer"
+        decoder_conf: Optional[Dict[str, Any]] = None,
+        n_fft: int = 512,
+        hop_length: int = 128,
+        win_length: Optional[int] = None,
+        fs: int = 16000,
+        n_mels: int = 80,
+        embedding_loss_weight: float = 1.0,
+        ema_decay: float = 0.999,
+        window: str = "hann",
+        center: bool = True,
+        normalized: bool = False,
+        onesided: bool = True,
+    ):
+        # Convert patch_size to tuple if it's a list (from YAML config)
+        # This must be done before type checking
+        if isinstance(patch_size, list):
+            patch_size = tuple(patch_size)
+        
+        super().__init__()
+
+        self.output_dim = output_dim
+        self.embedding_dim = embedding_dim
+        self.context_encoder_dim = context_encoder_dim
+        self.target_encoder_dim = target_encoder_dim
+        self.predictor_dim = predictor_dim
+        self.decoder_dim = decoder_dim
+        self.num_context_encoder_layers = num_context_encoder_layers
+        self.num_target_encoder_layers = num_target_encoder_layers
+        self.num_predictor_layers = num_predictor_layers
+        self.num_decoder_layers = num_decoder_layers
+        self.patch_size: Tuple[int, int] = patch_size  # Now guaranteed to be tuple
+        self.mask_ratio = mask_ratio
+        self.dropout_rate = dropout_rate
+        self.hop_length = hop_length
+        self.n_mels = n_mels
+        self.embedding_loss_weight = embedding_loss_weight
+        self.ema_decay = ema_decay
+        self.encoder_type = encoder_type
+        self.encoder_conf = encoder_conf or {}
+        self.predictor_type = predictor_type
+        self.predictor_conf = predictor_conf or {}
+        self.decoder_type = decoder_type
+        self.decoder_conf = decoder_conf or {}
+
+        # STFT and Log-Mel transform (same as default frontend)
+        self.stft = Stft(
+            n_fft=n_fft,
+            win_length=win_length,
+            hop_length=hop_length,
+            window=window,
+            center=center,
+            normalized=normalized,
+            onesided=onesided,
+        )
+        self.logmel = LogMel(
+            fs=fs,
+            n_fft=n_fft,
+            n_mels=n_mels,
+            fmin=None,
+            fmax=None,
+            htk=False,
+        )
+
+        # Context Encoder: Processes unmasked noisy patches
+        # Input: flattened patches (B, num_patches, patch_time * patch_freq)
+        # Note: patch_freq is a subset of mel bins (n_mels), not all mel bins
+        # Output: context features (B, num_patches, embedding_dim)
+        patch_dim = patch_size[0] * patch_size[1]  # patch_time * patch_freq
+        
+        if encoder_type == "transformer":
+            # Transformer encoder
+            encoder_num_layers = self.encoder_conf.get("num_layers", 6)
+            encoder_num_heads = self.encoder_conf.get("num_heads", 4)
+            encoder_ff_dim = self.encoder_conf.get("ff_dim", 1024)
+            encoder_dropout = self.encoder_conf.get("dropout_rate", dropout_rate)
+            encoder_attn_dropout = self.encoder_conf.get("attn_dropout_rate", 0.1)
+            use_pos_enc = self.encoder_conf.get("use_positional_encoding", True)
+            
+            # Patch embedding: project patch_dim to embedding_dim
+            self.context_patch_embed = nn.Linear(patch_dim, embedding_dim)
+            
+            # Positional encoding
+            if use_pos_enc:
+                self.context_pos_enc = PositionalEncoding(embedding_dim, encoder_dropout)
+            else:
+                self.context_pos_enc = None
+            
+            # Transformer encoder layers
+            self.context_encoder = self._build_transformer_encoder(
+                embedding_dim, encoder_num_layers, encoder_num_heads,
+                encoder_ff_dim, encoder_dropout, encoder_attn_dropout
+            )
+            
+            # Target encoder (same structure, will be updated via EMA)
+            self.target_patch_embed = nn.Linear(patch_dim, embedding_dim)
+            if use_pos_enc:
+                self.target_pos_enc = PositionalEncoding(embedding_dim, encoder_dropout)
+            else:
+                self.target_pos_enc = None
+            self.target_encoder = self._build_transformer_encoder(
+                embedding_dim, encoder_num_layers, encoder_num_heads,
+                encoder_ff_dim, encoder_dropout, encoder_attn_dropout
+            )
+        else:
+            # MLP encoder (original implementation)
+            context_encoder_layers = []
+            input_dim = patch_dim
+            for i in range(num_context_encoder_layers):
+                context_encoder_layers.extend([
+                    nn.Linear(input_dim, context_encoder_dim),
+                    nn.LayerNorm(context_encoder_dim),
+                    nn.ReLU(),
+                    nn.Dropout(dropout_rate),
+                ])
+                input_dim = context_encoder_dim
+            context_encoder_layers.append(nn.Linear(input_dim, embedding_dim))
+            self.context_encoder = nn.Sequential(*context_encoder_layers)
+            self.context_patch_embed = None
+            self.context_pos_enc = None
+            
+            # Target Encoder: Processes clean patches (with EMA)
+            target_encoder_layers = []
+            input_dim = patch_dim
+            for i in range(num_target_encoder_layers):
+                target_encoder_layers.extend([
+                    nn.Linear(input_dim, target_encoder_dim),
+                    nn.LayerNorm(target_encoder_dim),
+                    nn.ReLU(),
+                    nn.Dropout(dropout_rate),
+                ])
+                input_dim = target_encoder_dim
+            target_encoder_layers.append(nn.Linear(input_dim, embedding_dim))
+            self.target_encoder = nn.Sequential(*target_encoder_layers)
+            self.target_patch_embed = None
+            self.target_pos_enc = None
+
+        # Predictor: Predicts target latents for masked regions from context features
+        # Input: context features (B, num_patches, embedding_dim)
+        # Output: predicted target latents (B, num_patches, embedding_dim)
+        if predictor_type == "transformer":
+            # Transformer predictor
+            pred_num_layers = self.predictor_conf.get("num_layers", num_predictor_layers)
+            pred_num_heads = self.predictor_conf.get("num_heads", 4)
+            pred_ff_dim = self.predictor_conf.get("ff_dim", 1024)
+            pred_dropout = self.predictor_conf.get("dropout_rate", dropout_rate)
+            pred_attn_dropout = self.predictor_conf.get("attn_dropout_rate", 0.1)
+            use_pos_enc = self.predictor_conf.get("use_positional_encoding", True)
+            
+            # Positional encoding
+            if use_pos_enc:
+                self.predictor_pos_enc = PositionalEncoding(embedding_dim, pred_dropout)
+            else:
+                self.predictor_pos_enc = None
+            
+            # Transformer encoder layers
+            self.predictor = self._build_transformer_encoder(
+                embedding_dim, pred_num_layers, pred_num_heads,
+                pred_ff_dim, pred_dropout, pred_attn_dropout
+            )
+        elif predictor_type == "mlp":
+            # Use config if provided, otherwise use default parameters
+            pred_num_layers = self.predictor_conf.get("num_layers", num_predictor_layers)
+            pred_hidden_dim = self.predictor_conf.get("hidden_dim", predictor_dim)
+            pred_dropout = self.predictor_conf.get("dropout_rate", dropout_rate)
+            
+            predictor_layers = []
+            input_dim = embedding_dim
+            for i in range(pred_num_layers):
+                predictor_layers.extend([
+                    nn.Linear(input_dim, pred_hidden_dim),
+                    nn.LayerNorm(pred_hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(pred_dropout),
+                ])
+                input_dim = pred_hidden_dim
+            predictor_layers.append(nn.Linear(input_dim, embedding_dim))
+            self.predictor = nn.Sequential(*predictor_layers)
+            self.predictor_pos_enc = None
+        else:
+            raise ValueError(f"Unsupported predictor_type: {predictor_type}")
+
+        # Decoder: Reconstructs mel patches from latents
+        # Input: latents (B, num_masked_patches, embedding_dim)
+        # Output: reconstructed patches (B, num_masked_patches, patch_dim)
+        if decoder_type == "mlp":
+            # Use config if provided, otherwise use default parameters
+            dec_num_layers = self.decoder_conf.get("num_layers", num_decoder_layers)
+            dec_hidden_dim = self.decoder_conf.get("hidden_dim", decoder_dim)
+            dec_dropout = self.decoder_conf.get("dropout_rate", dropout_rate)
+            
+            decoder_layers = []
+            input_dim = embedding_dim
+            for i in range(dec_num_layers):
+                decoder_layers.extend([
+                    nn.Linear(input_dim, dec_hidden_dim),
+                    nn.LayerNorm(dec_hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(dec_dropout),
+                ])
+                input_dim = dec_hidden_dim
+            decoder_layers.append(nn.Linear(input_dim, patch_dim))
+            self.decoder = nn.Sequential(*decoder_layers)
+        else:
+            raise ValueError(f"Unsupported decoder_type: {decoder_type}")
+
+        # Mask token for replacing masked patches (learnable)
+        # For transformer: mask token is in embedding space
+        # For MLP: mask token is in patch space
+        if encoder_type == "transformer":
+            self.mask_token = nn.Parameter(torch.zeros(1, 1, embedding_dim))
+        else:
+            self.mask_token = nn.Parameter(torch.zeros(1, 1, patch_dim))
+
+        # Initialize target encoder as copy of context encoder (will be updated via EMA)
+        if encoder_type == "transformer":
+            self.target_encoder.load_state_dict(self.context_encoder.state_dict())
+            self.target_patch_embed.load_state_dict(self.context_patch_embed.state_dict())
+            if self.target_pos_enc is not None and self.context_pos_enc is not None:
+                self.target_pos_enc.load_state_dict(self.context_pos_enc.state_dict())
+        else:
+            self.target_encoder.load_state_dict(self.context_encoder.state_dict())
+        
+        # Freeze target encoder (no gradients)
+        for param in self.target_encoder.parameters():
+            param.requires_grad = False
+        if self.target_patch_embed is not None:
+            for param in self.target_patch_embed.parameters():
+                param.requires_grad = False
+        if self.target_pos_enc is not None:
+            for param in self.target_pos_enc.parameters():
+                param.requires_grad = False
+
+        # Storage for loss computation
+        self._last_x_n = None
+        self._last_x_c = None
+        self._last_x_hat = None
+        self._last_mask = None
+        self._last_patch_grid = None
+        self._last_noisy_patches = None
+        self._last_clean_patches = None
+        self._last_reconstructed_patches = None
+
+    def _build_transformer_encoder(
+        self,
+        embedding_dim: int,
+        num_layers: int,
+        num_heads: int,
+        ff_dim: int,
+        dropout_rate: float,
+        attn_dropout_rate: float,
+    ) -> nn.Module:
+        """Build transformer encoder for patch sequences.
+        
+        Args:
+            embedding_dim: Embedding dimension
+            num_layers: Number of transformer layers
+            num_heads: Number of attention heads
+            ff_dim: Feed-forward dimension
+            dropout_rate: Dropout rate
+            attn_dropout_rate: Attention dropout rate
+            
+        Returns:
+            Transformer encoder module
+        """
+        # Build encoder layers
+        encoder_layers = repeat(
+            num_layers,
+            lambda lnum: EncoderLayer(
+                embedding_dim,
+                MultiHeadedAttention(
+                    num_heads,
+                    embedding_dim,
+                    attn_dropout_rate,
+                    qk_norm=False,
+                    use_flash_attn=False,
+                    causal=False,
+                    cross_attn=False,
+                ),
+                PositionwiseFeedForward(embedding_dim, ff_dim, dropout_rate),
+                dropout_rate,
+                normalize_before=True,
+                concat_after=False,
+            ),
+        )
+        
+        # Final layer norm
+        after_norm = LayerNorm(embedding_dim)
+        
+        return nn.ModuleDict({
+            "encoders": encoder_layers,
+            "after_norm": after_norm,
+        })
+
+    def output_size(self) -> int:
+        """Return the output dimension of the frontend."""
+        return self.output_dim
+
+    def _extract_logmel(
+        self,
+        input: torch.Tensor,
+        input_lengths: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Extract log-mel features from audio waveform."""
+        input_stft, feats_lens = self.stft(input, input_lengths)
+        if isinstance(input_stft, torch.Tensor):
+            assert input_stft.shape[-1] == 2, f"Expected last dim to be 2, got {input_stft.shape}"
+            input_stft = ComplexTensor(input_stft[..., 0], input_stft[..., 1])
+        input_power = input_stft.real**2 + input_stft.imag**2
+        log_mel, feats_lens = self.logmel(input_power, feats_lens)
+        return log_mel, feats_lens
+
+    def _create_patches(
+        self,
+        x: torch.Tensor,
+        feats_lens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int]]:
+        """Create patches from log-mel spectrogram.
+
+        Args:
+            x: (B, T, F) - Log-mel spectrogram where F is mel bins
+            feats_lens: (B,) - Length of each sequence
+
+        Returns:
+            patches: (B, num_patches, patch_time * patch_freq) - Flattened patches
+            patch_mask: (B, num_patches) - Boolean mask indicating which patches are valid
+            patch_grid: (num_patches_time, num_patches_freq) - Grid dimensions
+        """
+        B, T, F = x.shape
+        patch_time, patch_freq = self.patch_size
+
+        # Calculate number of patches
+        num_patches_time = (T + patch_time - 1) // patch_time  # Ceiling division
+        num_patches_freq = (F + patch_freq - 1) // patch_freq
+        num_patches = num_patches_time * num_patches_freq
+
+        # Pad if necessary
+        pad_time = num_patches_time * patch_time - T
+        pad_freq = num_patches_freq * patch_freq - F
+        if pad_time > 0 or pad_freq > 0:
+            x = torch.nn.functional.pad(x, (0, pad_freq, 0, pad_time))
+
+        # Reshape to patches: (B, num_patches_time, patch_time, num_patches_freq, patch_freq)
+        x = x.view(B, num_patches_time, patch_time, num_patches_freq, patch_freq)
+        # Permute to group patches: (B, num_patches_time, num_patches_freq, patch_time, patch_freq)
+        x = x.permute(0, 1, 3, 2, 4).contiguous()
+        # Reshape to (B, num_patches, patch_time, patch_freq)
+        x = x.view(B, num_patches, patch_time, patch_freq)
+        # Flatten patches: (B, num_patches, patch_time * patch_freq)
+        patches = x.view(B, num_patches, patch_time * patch_freq)
+
+        # Create mask for valid patches based on sequence lengths
+        patch_mask = torch.ones(B, num_patches, dtype=torch.bool, device=x.device)
+        for b in range(B):
+            valid_patches_time = (feats_lens[b] + patch_time - 1) // patch_time
+            if valid_patches_time < num_patches_time:
+                # Mark invalid patches (those beyond valid time steps)
+                invalid_start = valid_patches_time * num_patches_freq
+                patch_mask[b, invalid_start:] = False
+
+        return patches, patch_mask, (num_patches_time, num_patches_freq)
+
+    def _unpatch(
+        self,
+        patches: torch.Tensor,
+        original_shape: Tuple[int, int, int],
+        patch_grid: Tuple[int, int],
+    ) -> torch.Tensor:
+        """Reconstruct spectrogram from patches.
+
+        Args:
+            patches: (B, num_patches, patch_time * patch_freq) - Flattened patches
+            original_shape: (T, F) - Original shape (without batch dimension)
+            patch_grid: (num_patches_time, num_patches_freq) - Grid dimensions
+
+        Returns:
+            x: (B, T, F) - Reconstructed spectrogram
+        """
+        B, num_patches, patch_dim = patches.shape
+        T, F = original_shape
+        patch_time, patch_freq = self.patch_size
+        num_patches_time, num_patches_freq = patch_grid
+
+        # Reshape patches to (B, num_patches_time, num_patches_freq, patch_time, patch_freq)
+        patches = patches.view(B, num_patches_time, num_patches_freq, patch_time, patch_freq)
+        # Permute to (B, num_patches_time, patch_time, num_patches_freq, patch_freq)
+        patches = patches.permute(0, 1, 3, 2, 4).contiguous()
+        # Reshape to (B, num_patches_time * patch_time, num_patches_freq * patch_freq)
+        x = patches.view(B, num_patches_time * patch_time, num_patches_freq * patch_freq)
+
+        # Crop to original size
+        if x.shape[1] > T:
+            x = x[:, :T, :]
+        if x.shape[2] > F:
+            x = x[:, :, :F]
+
+        return x
+
+    def _random_mask_patches(
+        self,
+        num_patches: int,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Create random mask for patches.
+
+        Args:
+            num_patches: Number of patches
+            batch_size: Batch size
+            device: Device
+
+        Returns:
+            mask: (B, num_patches) - Boolean mask (True for masked patches)
+        """
+        num_masked = int(num_patches * self.mask_ratio)
+        mask = torch.zeros(batch_size, num_patches, dtype=torch.bool, device=device)
+        for b in range(batch_size):
+            # Randomly select patches to mask
+            indices = torch.randperm(num_patches, device=device)[:num_masked]
+            mask[b, indices] = True
+        return mask
+
+    def train(self, mode: bool = True):
+        """Set training mode.
+        
+        Override to ensure target_encoder always stays in eval mode.
+        """
+        super().train(mode)
+        self.target_encoder.eval()  # Always keep target encoder in eval mode
+        return self
+
+    def update_target_encoder(self):
+        """Update target encoder using EMA of context encoder.
+        
+        This should be called after each optimizer step during training.
+        """
+        with torch.no_grad():
+            if self.encoder_type == "transformer":
+                # Update transformer encoder
+                for target_param, context_param in zip(
+                    self.target_encoder.parameters(),
+                    self.context_encoder.parameters(),
+                ):
+                    target_param.data.mul_(self.ema_decay).add_(
+                        context_param.data, alpha=1 - self.ema_decay
+                    )
+                # Update patch embedding
+                for target_param, context_param in zip(
+                    self.target_patch_embed.parameters(),
+                    self.context_patch_embed.parameters(),
+                ):
+                    target_param.data.mul_(self.ema_decay).add_(
+                        context_param.data, alpha=1 - self.ema_decay
+                    )
+                # Update positional encoding if exists
+                if self.target_pos_enc is not None and self.context_pos_enc is not None:
+                    for target_param, context_param in zip(
+                        self.target_pos_enc.parameters(),
+                        self.context_pos_enc.parameters(),
+                    ):
+                        target_param.data.mul_(self.ema_decay).add_(
+                            context_param.data, alpha=1 - self.ema_decay
+                        )
+            else:
+                # Update MLP encoder
+                for target_param, context_param in zip(
+                    self.target_encoder.parameters(),
+                    self.context_encoder.parameters(),
+                ):
+                    target_param.data.mul_(self.ema_decay).add_(
+                        context_param.data, alpha=1 - self.ema_decay
+                    )
+
+    def forward(
+        self, input: torch.Tensor, input_lengths: torch.Tensor,
+        clean_input: Optional[torch.Tensor] = None,
+        clean_input_lengths: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward function.
+
+        Args:
+            input: (Batch, Nsamples) - Raw audio waveform (noisy speech)
+            input_lengths: (Batch,) - Length of each sequence
+            clean_input: Optional (Batch, Nsamples) - Clean speech for training
+            clean_input_lengths: Optional (Batch,) - Length of clean sequences
+
+        Returns:
+            output: (Batch, T, output_dim) - Denoised log-mel features
+            output_lengths: (Batch,) - Length of each sequence
+        """
+        # 1. Extract log-mel features from noisy input
+        x_n, feats_lens = self._extract_logmel(input, input_lengths)
+        B, T, F = x_n.shape
+        original_shape = (T, F)
+
+        # 2. Create patches from noisy log-mel
+        noisy_patches, patch_mask, patch_grid = self._create_patches(x_n, feats_lens)
+        num_patches = noisy_patches.shape[1]
+
+        # 3. Create mask for patches (random masking during training)
+        if self.training:
+            mask = self._random_mask_patches(num_patches, B, x_n.device)
+            # Combine with patch_mask (only mask valid patches)
+            mask = mask & patch_mask
+        else:
+            # During inference, don't mask (or use a fixed pattern)
+            mask = torch.zeros(B, num_patches, dtype=torch.bool, device=x_n.device)
+
+        # 4. Replace masked patches with mask token before encoding
+        if self.encoder_type == "transformer":
+            # For transformer: embed all patches first
+            noisy_patches_embedded = self.context_patch_embed(noisy_patches)  # (B, num_patches, embedding_dim)
+            # Replace masked patches with mask token in embedding space
+            if mask.any():
+                mask_token_expanded = self.mask_token.expand(B, num_patches, -1)  # (B, num_patches, embedding_dim)
+                mask_3d = mask.unsqueeze(-1)  # (B, num_patches, 1)
+                noisy_patches_embedded = torch.where(
+                    mask_3d, mask_token_expanded, noisy_patches_embedded
+                )
+        else:
+            # For MLP: replace masked patches with mask token in patch space
+            noisy_patches_masked = noisy_patches.clone()
+            if mask.any():
+                mask_token_expanded = self.mask_token.expand(B, num_patches, -1)  # (B, num_patches, patch_dim)
+                mask_3d = mask.unsqueeze(-1)  # (B, num_patches, 1)
+                noisy_patches_masked = torch.where(
+                    mask_3d, mask_token_expanded, noisy_patches_masked
+                )
+        
+        # 5. Process all patches through context encoder
+        if self.encoder_type == "transformer":
+            # Use embedded patches with mask tokens
+            context_features = noisy_patches_embedded  # (B, num_patches, embedding_dim)
+            
+            # Add positional encoding
+            if self.context_pos_enc is not None:
+                context_features = self.context_pos_enc(context_features)
+            
+            # Create mask for valid patches (for transformer attention)
+            # mask shape: (B, 1, num_patches) - True for valid patches
+            valid_mask = patch_mask.unsqueeze(1)  # (B, 1, num_patches)
+            
+            # Apply transformer encoder layers
+            for encoder_layer in self.context_encoder["encoders"]:
+                context_features, valid_mask = encoder_layer(context_features, valid_mask)
+            
+            # Apply final layer norm
+            context_features = self.context_encoder["after_norm"](context_features)
+        else:
+            # MLP encoder
+            context_features = self.context_encoder(noisy_patches_masked)  # (B, num_patches, embedding_dim)
+        
+        if mask.any() and self.training and clean_input is not None:
+            # Training mode: use target encoder for clean patches
+            lens = clean_input_lengths if clean_input_lengths is not None else input_lengths
+            x_c, _ = self._extract_logmel(clean_input, lens)
+            clean_patches, _, _ = self._create_patches(x_c, lens)
+            
+            # Encode clean patches with target encoder (EMA)
+            with torch.no_grad():
+                if self.encoder_type == "transformer":
+                    # Embed patches
+                    target_latents = self.target_patch_embed(clean_patches)  # (B, num_patches, embedding_dim)
+                    
+                    # Add positional encoding
+                    if self.target_pos_enc is not None:
+                        target_latents = self.target_pos_enc(target_latents)
+                    
+                    # Create mask for valid patches
+                    valid_mask = patch_mask.unsqueeze(1)  # (B, 1, num_patches)
+                    
+                    # Apply transformer encoder layers
+                    for encoder_layer in self.target_encoder["encoders"]:
+                        target_latents, valid_mask = encoder_layer(target_latents, valid_mask)
+                    
+                    # Apply final layer norm
+                    target_latents = self.target_encoder["after_norm"](target_latents)
+                else:
+                    target_latents = self.target_encoder(clean_patches)  # (B, num_patches, embedding_dim)
+            
+            # Predict target latents for masked regions
+            if self.predictor_type == "transformer":
+                # Transformer predictor: process all context features
+                pred_features = context_features  # (B, num_patches, embedding_dim)
+                
+                # Add positional encoding
+                if self.predictor_pos_enc is not None:
+                    pred_features = self.predictor_pos_enc(pred_features)
+                
+                # Create mask for valid patches
+                valid_mask = patch_mask.unsqueeze(1)  # (B, 1, num_patches)
+                
+                # Apply transformer encoder layers
+                for encoder_layer in self.predictor["encoders"]:
+                    pred_features, valid_mask = encoder_layer(pred_features, valid_mask)
+                
+                # Apply final layer norm
+                predicted_latents = self.predictor["after_norm"](pred_features)  # (B, num_patches, embedding_dim)
+            else:
+                # MLP predictor
+                predicted_latents = self.predictor(context_features)  # (B, num_patches, embedding_dim)
+            
+            # Select masked patches
+            masked_predicted_latents = predicted_latents[mask.unsqueeze(-1).expand_as(predicted_latents)].view(-1, self.embedding_dim)
+            
+            # Decode masked patches
+            reconstructed_patches = self.decoder(masked_predicted_latents)  # (num_masked, patch_dim)
+            
+            # Merge: unmasked from x_n, masked from reconstruction
+            # Reconstruct full patch structure with masked patches replaced
+            full_reconstructed_patches = noisy_patches.clone()
+            # Replace masked patches with reconstructed ones (match dtype for AMP)
+            full_reconstructed_patches[mask] = reconstructed_patches.to(full_reconstructed_patches.dtype)
+            
+            # Reconstruct spectrogram from patches
+            x_hat = self._unpatch(full_reconstructed_patches, original_shape, patch_grid)
+            
+            # Store for loss computation
+            self._last_x_n = x_n
+            self._last_x_c = x_c
+            self._last_x_hat = x_hat
+            self._last_mask = mask
+            self._last_patch_grid = patch_grid
+            self._last_noisy_patches = noisy_patches
+            self._last_clean_patches = clean_patches
+            self._last_reconstructed_patches = reconstructed_patches
+        else:
+            # Inference mode: predict and decode masked patches
+            if mask.any():
+                if self.predictor_type == "transformer":
+                    # Transformer predictor: process all context features
+                    pred_features = context_features  # (B, num_patches, embedding_dim)
+                    
+                    # Add positional encoding
+                    if self.predictor_pos_enc is not None:
+                        pred_features = self.predictor_pos_enc(pred_features)
+                    
+                    # Create mask for valid patches
+                    valid_mask = patch_mask.unsqueeze(1)  # (B, 1, num_patches)
+                    
+                    # Apply transformer encoder layers
+                    for encoder_layer in self.predictor["encoders"]:
+                        pred_features, valid_mask = encoder_layer(pred_features, valid_mask)
+                    
+                    # Apply final layer norm
+                    predicted_latents = self.predictor["after_norm"](pred_features)  # (B, num_patches, embedding_dim)
+                    
+                    # Select masked patches
+                    masked_predicted_latents = predicted_latents[mask.unsqueeze(-1).expand_as(predicted_latents)].view(-1, self.embedding_dim)
+                else:
+                    # MLP predictor: process only masked patches
+                    masked_context_features = context_features[mask.unsqueeze(-1).expand_as(context_features)].view(-1, self.embedding_dim)
+                    masked_predicted_latents = self.predictor(masked_context_features)
+                
+                reconstructed_patches = self.decoder(masked_predicted_latents)
+                
+                # Merge patches back into spectrogram (match dtype for AMP)
+                full_reconstructed_patches = noisy_patches.clone()
+                full_reconstructed_patches[mask] = reconstructed_patches.to(full_reconstructed_patches.dtype)
+                x_hat = self._unpatch(full_reconstructed_patches, original_shape, patch_grid)
+            else:
+                x_hat = x_n
+            
+            self._last_x_n = None
+            self._last_x_c = None
+            self._last_x_hat = None
+            self._last_mask = None
+            self._last_patch_grid = None
+            self._last_noisy_patches = None
+            self._last_clean_patches = None
+            self._last_reconstructed_patches = None
+
+        return x_hat, feats_lens
+
+    def compute_jepa_loss(self) -> Optional[torch.Tensor]:
+        """Compute JEPA reconstruction loss on masked patches.
+        
+        Returns:
+            loss: Scalar reconstruction loss, or None if not in training mode
+        """
+        if self._last_reconstructed_patches is None or self._last_clean_patches is None or self._last_mask is None:
+            return None
+        
+        if not self._last_mask.any():
+            return None
+
+        # Align sequence length defensively when paired noisy/clean streams are
+        # not perfectly matched (e.g., speed-perturbed noisy vs. non-perturbed clean).
+        mask = self._last_mask
+        clean_patches = self._last_clean_patches
+        reconstructed = self._last_reconstructed_patches
+        if mask.dim() != 2 or clean_patches.dim() != 3 or reconstructed.dim() != 2:
+            return None
+
+        n_patches = min(mask.size(1), clean_patches.size(1))
+        if n_patches <= 0:
+            return None
+        mask = mask[:, :n_patches]
+        clean_patches = clean_patches[:, :n_patches, :]
+        if not mask.any():
+            return None
+
+        # Use target patches (from clean) for masked regions.
+        masked_clean_patches = clean_patches[mask]
+        # In edge cases, the number of reconstructed patches can differ by a small
+        # amount after alignment. Use common prefix to keep training robust.
+        n_masked = min(reconstructed.size(0), masked_clean_patches.size(0))
+        if n_masked <= 0:
+            return None
+        reconstructed = reconstructed[:n_masked]
+        masked_clean_patches = masked_clean_patches[:n_masked]
+
+        # Compute MSE loss on masked patches
+        loss = F.mse_loss(reconstructed, masked_clean_patches, reduction='mean')
+        
+        return loss * self.embedding_loss_weight
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict,
+        prefix: str,
+        local_metadata: dict,
+        strict: bool,
+        missing_keys: list,
+        unexpected_keys: list,
+        error_msgs: list,
+    ):
+        """Handle loading state dict with backward compatibility for mask_token.
+        
+        This allows loading checkpoints that don't have mask_token (older versions).
+        """
+        mask_token_key = prefix + "mask_token"
+        if mask_token_key in missing_keys:
+            missing_keys.remove(mask_token_key)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )

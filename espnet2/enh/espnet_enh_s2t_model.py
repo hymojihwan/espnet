@@ -1,6 +1,6 @@
 import logging
 import random
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Dict, List, Tuple, Union
 
 import numpy as np
@@ -36,6 +36,10 @@ class ESPnetEnhS2TModel(AbsESPnetModel):
         s2t_model: Union[ESPnetASRModel, ESPnetSTModel, ESPnetDiarizationModel],
         calc_enh_loss: bool = True,
         bypass_enh_prob: float = 0,  # 0 means do not bypass enhancement for all data
+        # When True: run enhancement under no_grad and detach waveforms before ASR/ST.
+        # Use with --freeze_param enh_model (and optional --init_param from a trained enh checkpoint)
+        # so only the ASR (e.g. CTC) branch is trained; no backward through the enh stack.
+        enh_frontend_no_grad: bool = False,
     ):
 
         super().__init__()
@@ -44,6 +48,13 @@ class ESPnetEnhS2TModel(AbsESPnetModel):
 
         self.bypass_enh_prob = bypass_enh_prob
 
+        self.enh_frontend_no_grad = enh_frontend_no_grad
+        if enh_frontend_no_grad and calc_enh_loss:
+            logging.warning(
+                "enh_frontend_no_grad=True: disabling calc_enh_loss so no SI-SNR backward "
+                "through a frozen enhancement stack."
+            )
+            calc_enh_loss = False
         self.calc_enh_loss = calc_enh_loss
         if isinstance(self.s2t_model, ESPnetDiarizationModel):
             self.extract_feats_in_collect_stats = False
@@ -234,10 +245,14 @@ class ESPnetEnhS2TModel(AbsESPnetModel):
         loss_enh = None
         perm = None
         if not bypass_enh_flag:
-            ret = self.enh_model.forward_enhance(
-                speech, speech_lengths, {"num_spk": num_spk}
-            )
-            speech_pre, feature_mix, feature_pre, others = ret
+            enh_ctx = torch.no_grad() if self.enh_frontend_no_grad else nullcontext()
+            with enh_ctx:
+                ret = self.enh_model.forward_enhance(
+                    speech, speech_lengths, {"num_spk": num_spk}
+                )
+                speech_pre, feature_mix, feature_pre, others = ret
+                if self.enh_frontend_no_grad:
+                    speech_pre = [s.detach() for s in speech_pre]
             # loss computation
             if not skip_enhloss_flag:
                 loss_enh, _, _, perm = self.enh_model.forward_loss(
@@ -264,7 +279,14 @@ class ESPnetEnhS2TModel(AbsESPnetModel):
 
         # 2. ASR or ST
         if isinstance(self.s2t_model, ESPnetASRModel):  # ASR
-            if perm is None:
+            if len(speech_pre) == 1:
+                loss_s2t, stats, weight = self.s2t_model(
+                    speech_pre[0],
+                    speech_lengths,
+                    text.unbind(2)[0],
+                    text_ref_lengths[0],
+                )
+            elif perm is None:
                 loss_s2t, stats, weight = self.asr_pit_loss(
                     speech_pre, speech_lengths, text.unbind(2), text_ref_lengths
                 )

@@ -1,0 +1,106 @@
+# JEPA Residual Denoiser Frontend for CTC ASR (from scratch)
+# This configuration uses JEPA residual denoiser that outputs denoised log-mel features
+# Architecture: x_hat = x_n + α(t) * Δx where α(t) starts at 0 and gradually increases
+
+# general
+batch_type: numel
+batch_bins: 24000000
+accum_grad: 16
+max_epoch: 100
+patience: none
+init: none  # No pretrained model initialization
+best_model_criterion:
+-   - valid
+    - wer_ctc
+    - min
+keep_nbest_models: 10
+
+# JEPA Residual Frontend configuration
+# Outputs denoised log-mel features (80-dim, same as baseline)
+frontend: jepa_residual
+frontend_conf:
+    # Predictor architecture parameters
+    predictor_dim: 256
+    num_predictor_layers: 2
+    dropout_rate: 0.1
+    # Audio processing parameters (same as baseline)
+    n_fft: 512
+    hop_length: 128
+    win_length: 512
+    fs: 16000
+    n_mels: 80  # Output dimension (log-mel)
+    # Residual mixing schedule
+    embedding_loss_weight: 1000.0  # Residual loss weight (increased to match CTC loss scale)
+    residual_mix_start: 0.0  # Initial mixing weight (no residual at start)
+    residual_mix_end: 1.0  # Final mixing weight (full residual)
+    residual_mix_warmup_steps: 15000  # Number of steps to gradually increase mixing weight
+
+# Pre-encoder: Not needed - JEPA residual frontend outputs 80-dim log-mel directly
+preencoder: null
+preencoder_conf: {}
+
+# Encoder: Conformer (trained from scratch, same as standard CTC)
+encoder: conformer
+encoder_conf:
+    output_size: 256
+    attention_heads: 4
+    linear_units: 1024
+    num_blocks: 18
+    dropout_rate: 0.1
+    positional_dropout_rate: 0.1
+    attention_dropout_rate: 0.1
+    input_layer: conv2d
+    normalize_before: true
+    macaron_style: true
+    rel_pos_type: latest
+    pos_enc_layer_type: rel_pos
+    selfattention_layer_type: rel_selfattn
+    activation_type: swish
+    use_cnn_module: true
+    cnn_module_kernel: 31
+
+# CTC model configuration (standard CTC, no progressive schedule needed)
+model_conf:
+    ctc_weight: 1.0
+    lsm_weight: 0.1
+    length_normalized_loss: false
+    report_cer: True
+    report_wer: True
+
+# Decoder: None (CTC-only mode)
+decoder: null
+decoder_conf: {}
+
+# optimizer (same as standard CTC training)
+optim: adam
+optim_conf:
+    lr: 0.002  # Standard learning rate (same as train_conformer_ctc.yaml)
+    weight_decay: 0.000001
+scheduler: warmuplr
+scheduler_conf:
+    warmup_steps: 15000  # Standard warmup steps (same as train_conformer_ctc.yaml)
+
+num_att_plot: 0
+
+# SpecAugment: Enabled (can use specaug with residual denoiser)
+specaug: specaug
+specaug_conf:
+    apply_time_warp: true
+    time_warp_window: 5
+    time_warp_mode: bicubic
+    apply_freq_mask: true
+    freq_mask_width_range:
+    - 0
+    - 27
+    num_freq_mask: 2
+    apply_time_mask: true
+    time_mask_width_ratio_range:
+    - 0.
+    - 0.05
+    num_time_mask: 5
+
+# Normalization: Use global MVN (same as standard CTC training)
+normalize: global_mvn
+normalize_conf:
+    stats_file: exp/asr_stats_raw_en_bpe2048/train/feats_stats.npz
+

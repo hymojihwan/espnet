@@ -46,19 +46,34 @@ fi
 cd $dir
 
 if [[ "$track" == "1" ]]; then
-  # 1-ch track
-  find ${audio_dir}/isolated/ -name '*.wav' | grep 'tr05_bus_simu\|tr05_caf_simu\|tr05_ped_simu\|tr05_str_simu' | sort -u > tr05_simu_$enhan.flist
+  # 1-ch only. Train=random SNR; valid/test=baseline (MATLAB writes to *_simu/); test adds per-SNR sets (et05_*_simu_snr*) when present.
+  find ${audio_dir}/isolated/ -name '*.wav' | grep 'tr05_bus_simu\|tr05_caf_simu\|tr05_ped_simu\|tr05_str_simu' | grep -v '_snr' | sort -u > tr05_simu_$enhan.flist
   if [ ! -f "${annotations}/dt05_simu_1ch_track.list" ]; then
     echo "Error: No such file: ${annotations}/dt05_simu_1ch_track.list"
     exit 1
   fi
-  awk -v dir="${audio_dir}/isolated" '{print(dir "/" $1)}' ${annotations}/dt05_simu_1ch_track.list | sort -u > dt05_simu_$enhan.flist
+  sed -E 's/\.CH[0-9]+\.wav$/.CH1.wav/' ${annotations}/dt05_simu_1ch_track.list \
+    | awk -v dir="${audio_dir}/isolated" '{print(dir "/" $1)}' | sort -u > dt05_simu_$enhan.flist
   if $eval_flag; then
     if [ ! -f "${extra_annotations}/et05_simu_1ch_track.list" ]; then
       echo "Error: No such file: ${extra_annotations}/et05_simu_1ch_track.list"
       exit 1
     fi
-    awk -v dir="${audio_dir}/isolated" '{print(dir "/" $1)}' ${extra_annotations}/et05_simu_1ch_track.list | sort -u > et05_simu_$enhan.flist
+    sed -E 's/\.CH[0-9]+\.wav$/.CH1.wav/' ${extra_annotations}/et05_simu_1ch_track.list \
+      | awk -v dir="${audio_dir}/isolated" '{print(dir "/" $1)}' | sort -u > et05_simu_$enhan.flist
+  fi
+  snr_list=""
+  if [ -d "${audio_dir}/isolated/et05_bus_simu_snr-5" ] || [ -d "${audio_dir}/isolated/et05_bus_simu_snr15" ]; then
+    snr_list="-5 0 5 10 15"
+    for snr in $snr_list; do
+      sed -e 's|et05_bus_simu|et05_bus_simu_snr'"$snr"'|g; s|et05_caf_simu|et05_caf_simu_snr'"$snr"'|g; s|et05_ped_simu|et05_ped_simu_snr'"$snr"'|g; s|et05_str_simu|et05_str_simu_snr'"$snr"'|g' \
+        "${extra_annotations}/et05_simu_1ch_track.list" \
+        | sed -E 's/\.CH[0-9]+\.wav$/.CH1.wav/' \
+        | awk -v dir="${audio_dir}/isolated" '{print(dir "/" $1)}' | sort -u > et05_simu_snr${snr}_$enhan.flist
+    done
+    if $eval_flag; then
+      for snr in $snr_list; do list_set+=" et05_simu_snr${snr}_$enhan"; done
+    fi
   fi
 
   # make a scp file from file list
@@ -145,6 +160,18 @@ if $eval_flag; then
 cat et05_simu.dot | sed -e 's/(\(.*\))/\1/' | awk '{print $NF "_SIMU"}'> et05_simu_$enhan.ids
 cat et05_simu.dot | sed -e 's/(.*)//' > et05_simu_$enhan.txt
 paste -d" " et05_simu_$enhan.ids et05_simu_$enhan.txt | sort -k 1 > et05_simu_$enhan.trans1
+fi
+# For 1ch: build .ids/.txt/.trans1 for per-SNR test sets (et05_simu_snr*) only
+if [[ "$track" == "1" ]] && [ -n "$snr_list" ]; then
+  for snr in $snr_list; do
+    x=et05_simu_snr${snr}_$enhan
+    if [ -f "${x}.flist" ]; then
+      awk -F'[/]' '{print $NF}' $x.flist | sed 's/\.CH[0-9]\.wav/_SIMU/' > ${x}.ids
+      awk 'BEGIN{while((getline<"et05_simu.dot")>0){match($0,/\([^)]+\)/);utt=substr($0,RSTART+1,RLENGTH-2);sub(/ *\([^)]*\) *$/,"");text=$0;sub(/^ +/,"");gsub(/^ +| +$/,"",text);map[utt]=text}}
+           {utt=$0;sub(/_SIMU$/,"",utt);print (map[utt]!="")?map[utt]:$0}' ${x}.ids > ${x}.txt
+      paste -d" " ${x}.ids ${x}.txt | sort -k 1 > ${x}.trans1
+    fi
+  done
 fi
 
 # Do some basic normalization steps.  At this point we don't remove OOVs--

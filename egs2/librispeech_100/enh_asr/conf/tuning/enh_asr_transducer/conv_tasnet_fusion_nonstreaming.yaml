@@ -1,0 +1,127 @@
+# Enhancement + ASR Transducer training with Feature Fusion
+# No OT alignment, just enhanced + noisy feature fusion
+
+# Training configuration
+max_epoch: 50
+log_interval: 100
+
+# Data configuration
+batch_type: numel
+batch_bins: 2200000
+accum_grad: 16
+grad_clip: 5.0
+log_interval: 100
+
+# Optimization (Learning rate 감소 + weight decay 증가)
+optim: adam
+optim_conf:
+  lr: 0.0003  # 0.001 → 0.0003 (pre-trained model fine-tuning)
+  weight_decay: 0.00001  # 0.000001 → 0.00001 (regularization 강화)
+
+scheduler: warmuplr
+scheduler_conf:
+  warmup_steps: 5000  # 15000 → 5000 (더 빨리 peak에 도달)
+
+val_scheduler_criterion:
+  - valid
+  - loss
+
+best_model_criterion:
+  -   - valid
+      - loss
+      - min
+
+keep_nbest_models: 10
+
+# Model configuration using baseline ConvTasNet + Feature Fusion
+model_conf:
+  # Enable feature fusion model (enhanced + noisy features)
+  use_fusion: true
+  
+  # Loss weights (SE와 ASR 균형)
+  enh_weight: 0.2  # SE와 ASR 균형
+  transducer_weight: 1.0
+  
+  # Training configuration
+  freeze_asr: False
+  auxiliary_ctc_weight: 0.0
+  report_cer: True
+  report_wer: True
+
+# Enhancement configuration (baseline ConvTasNet)
+enh_encoder: same  # Use raw waveform directly
+enh_encoder_conf: {}
+
+enh_separator: conv_tasnet_baseline
+enh_separator_conf:
+  num_filters: 256  # 512 → 256
+  filter_length: 16
+  bottleneck_channels: 64  # 128 → 64
+  hidden_channels: 256  # 512 → 256
+  kernel_size: 3
+  num_blocks_per_repeat: 8
+  num_repeats: 2  # 4 → 2 (메모리 대폭 감소)
+  num_speakers: 1
+
+enh_decoder: same  # Use raw waveform directly
+enh_decoder_conf: {}
+
+# Enhancement criterion configuration
+enh_criterion: si_snr
+enh_criterion_conf: {}
+
+# Frontend configuration for feature extraction
+frontend: default
+frontend_conf:
+  n_mels: 80
+  n_fft: 512
+  hop_length: 160
+  win_length: 400
+  fmin: 0
+  fmax: null
+
+# SpecAug disabled for enhancement + ASR
+normalize: utterance_mvn
+normalize_conf: {}
+
+# ASR Encoder configuration (Conformer)
+encoder_conf:
+  main_conf:
+    pos_wise_act_type: swish
+    conv_mod_act_type: swish
+    pos_enc_dropout_rate: 0.2
+    dynamic_chunk_training: False
+    short_chunk_threshold: 0.75
+    short_chunk_size: 25
+    num_left_chunks: 4
+  input_conf:
+    vgg_like: True
+  body_conf:
+  - block_type: conformer
+    linear_size: 2048
+    hidden_size: 512
+    heads: 8
+    dropout_rate: 0.1
+    pos_wise_dropout_rate: 0.1
+    att_dropout_rate: 0.1
+    conv_mod_kernel_size: 31
+    num_blocks: 12
+
+# ASR Decoder configuration (Prediction Network)
+decoder: rnn
+decoder_conf:
+  rnn_type: lstm
+  num_layers: 1
+  embed_size: 512
+  hidden_size: 512
+  dropout_rate: 0.1
+  embed_dropout_rate: 0.2
+
+# Joint Network configuration
+joint_network_conf:
+  joint_space_size: 512
+
+# Token configuration
+token_type: bpe
+bpemodel: data/en_token_list/bpe_unigram2048/bpe.model
+

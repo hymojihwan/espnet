@@ -1,0 +1,236 @@
+[
+  {
+    "epoch": 1,
+    "train_time_seconds": 525.1283924537711,
+    "valid_time_seconds": 32.83758411207236,
+    "total_time_seconds": 557.9665615609847,
+    "train_time_formatted": "8 minutes and 45.13 seconds",
+    "valid_time_formatted": "32.84 seconds",
+    "total_time_formatted": "9 minutes and 17.97 seconds"
+  },
+  {
+    "epoch": 2,
+    "train_time_seconds": 539.1250507328659,
+    "valid_time_seconds": 32.181353653082624,
+    "total_time_seconds": 571.3066620139871,
+    "train_time_formatted": "8 minutes and 59.13 seconds",
+    "valid_time_formatted": "32.18 seconds",
+    "total_time_formatted": "9 minutes and 31.31 seconds"
+  },
+  {
+    "epoch": 3,
+    "train_time_seconds": 540.8263254528865,
+    "valid_time_seconds": 32.30316110304557,
+    "total_time_seconds": 573.1297505369876,
+    "train_time_formatted": "9 minutes and 0.83 seconds",
+    "valid_time_formatted": "32.3 seconds",
+    "total_time_formatted": "9 minutes and 33.13 seconds"
+  },
+  {
+    "epoch": 4,
+    "train_time_seconds": 548.8177962710615,
+    "valid_time_seconds": 33.068813771009445,
+    "total_time_seconds": 581.8868708130904,
+    "train_time_formatted": "9 minutes and 8.82 seconds",
+    "valid_time_formatted": "33.07 seconds",
+    "total_time_formatted": "9 minutes and 41.89 seconds"
+  },
+  {
+    "epoch": 5,
+    "train_time_seconds": 540.2956669330597,
+    "valid_time_seconds": 32.195068520028144,
+    "total_time_seconds": 572.4909892969299,
+    "train_time_formatted": "9 minutes and 0.3 seconds",
+    "valid_time_formatted": "32.2 seconds",
+    "total_time_formatted": "9 minutes and 32.49 seconds"
+  },
+  {
+    "epoch": 6,
+    "train_time_seconds": 541.0248550900724,
+    "valid_time_seconds": 32.05055195419118,
+    "total_time_seconds": 573.0756771869492,
+    "train_time_formatted": "9 minutes and 1.02 seconds",
+    "valid_time_formatted": "32.05 seconds",
+    "total_time_formatted": "9 minutes and 33.08 seconds"
+  },
+  {
+    "epoch": 7,
+    "train_time_seconds": 540.8935165919829,
+    "valid_time_seconds": 32.042765769176185,
+    "total_time_seconds": 572.93653957895,
+    "train_time_formatted": "9 minutes and 0.89 seconds",
+    "valid_time_formatted": "32.04 seconds",
+    "total_time_formatted": "9 minutes and 32.94 seconds"
+  },
+  {
+    "epoch": 8,
+    "train_time_seconds": 541.6600580269005,
+    "valid_time_seconds": 32.121968507999554,
+    "total_time_seconds": 573.7822792080697,
+    "train_time_formatted": "9 minutes and 1.66 seconds",
+    "valid_time_formatted": "32.12 seconds",
+    "total_time_formatted": "9 minutes and 33.78 seconds"
+  },
+  {
+    "epoch": 9,
+    "train_time_seconds": 540.0057773219887,
+    "valid_time_seconds": 31.9225905041676,
+    "total_time_seconds": 571.928620418068,
+    "train_time_formatted": "9 minutes and 0.01 seconds",
+    "valid_time_formatted": "31.92 seconds",
+    "total_time_formatted": "9 minutes and 31.93 seconds"
+  },
+  {
+    "epoch": 10,
+    "train_time_seconds": 542.0597783569247,
+    "valid_time_seconds": 32.162940628128126,
+    "total_time_seconds": 574.2229699690361,
+    "train_time_formatted": "9 minutes and 2.06 seconds",
+    "valid_time_formatted": "32.16 seconds",
+    "total_time_formatted": "9 minutes and 34.22 seconds"
+  },
+  {
+    "epoch": 11,
+    "train_time_seconds": 541.2714302169625,
+    "valid_time_seconds": 31.853335208026692,
+    "total_time_seconds": 573.1250090450048,
+    "train_time_formatted": "9 minutes and 1.27 seconds",
+    "valid_time_formatted": "31.85 seconds",
+    "total_time_formatted": "9 minutes and 33.13 seconds"
+  },
+  {
+    "epoch": 12,
+    "train_time_seconds": 541.115797370905,
+    "valid_time_seconds": 32.06059045018628,
+    "total_time_seconds": 573.1766364958603,
+    "train_time_formatted": "9 minutes and 1.12 seconds",
+    "valid_time_formatted": "32.06 seconds",
+    "total_time_formatted": "9 minutes and 33.18 seconds"
+  },
+  {
+    "epoch": 13,
+    "train_time_seconds": 541.4816669328138,
+    "valid_time_seconds": 33.03033005190082,
+    "total_time_seconds": 574.5122585850768,
+    "train_time_formatted": "9 minutes and 1.48 seconds",
+    "valid_time_formatted": "33.03 seconds",
+    "total_time_formatted": "9 minutes and 34.51 seconds"
+  },
+  {
+    "epoch": 14,
+    "train_time_seconds": 540.709561151918,
+    "valid_time_seconds": 32.07028333400376,
+    "total_time_seconds": 572.7801141249947,
+    "train_time_formatted": "9 minutes and 0.71 seconds",
+    "valid_time_formatted": "32.07 seconds",
+    "total_time_formatted": "9 minutes and 32.78 seconds"
+  },
+  {
+    "epoch": 15,
+    "train_time_seconds": 541.4436064830516,
+    "valid_time_seconds": 32.7732266089879,
+    "total_time_seconds": 574.2170921121724,
+    "train_time_formatted": "9 minutes and 1.44 seconds",
+    "valid_time_formatted": "32.77 seconds",
+    "total_time_formatted": "9 minutes and 34.22 seconds"
+  },
+  {
+    "epoch": 16,
+    "train_time_seconds": 541.364918902982,
+    "valid_time_seconds": 31.842063151998445,
+    "total_time_seconds": 573.2072310738731,
+    "train_time_formatted": "9 minutes and 1.36 seconds",
+    "valid_time_formatted": "31.84 seconds",
+    "total_time_formatted": "9 minutes and 33.21 seconds"
+  },
+  {
+    "epoch": 17,
+    "train_time_seconds": 540.4571580989286,
+    "valid_time_seconds": 32.07985053793527,
+    "total_time_seconds": 572.5372581479605,
+    "train_time_formatted": "9 minutes and 0.46 seconds",
+    "valid_time_formatted": "32.08 seconds",
+    "total_time_formatted": "9 minutes and 32.54 seconds"
+  },
+  {
+    "epoch": 18,
+    "train_time_seconds": 541.6460879710503,
+    "valid_time_seconds": 31.839491029037163,
+    "total_time_seconds": 573.4858371631708,
+    "train_time_formatted": "9 minutes and 1.65 seconds",
+    "valid_time_formatted": "31.84 seconds",
+    "total_time_formatted": "9 minutes and 33.49 seconds"
+  },
+  {
+    "epoch": 19,
+    "train_time_seconds": 540.6566820640583,
+    "valid_time_seconds": 32.17015609308146,
+    "total_time_seconds": 572.8270886770915,
+    "train_time_formatted": "9 minutes and 0.66 seconds",
+    "valid_time_formatted": "32.17 seconds",
+    "total_time_formatted": "9 minutes and 32.83 seconds"
+  },
+  {
+    "epoch": 20,
+    "train_time_seconds": 540.2087558859494,
+    "valid_time_seconds": 32.000572269782424,
+    "total_time_seconds": 572.2095799639355,
+    "train_time_formatted": "9 minutes and 0.21 seconds",
+    "valid_time_formatted": "32 seconds",
+    "total_time_formatted": "9 minutes and 32.21 seconds"
+  },
+  {
+    "epoch": 21,
+    "train_time_seconds": 540.5596012519673,
+    "valid_time_seconds": 32.31011506798677,
+    "total_time_seconds": 572.8699642498977,
+    "train_time_formatted": "9 minutes and 0.56 seconds",
+    "valid_time_formatted": "32.31 seconds",
+    "total_time_formatted": "9 minutes and 32.87 seconds"
+  },
+  {
+    "epoch": 22,
+    "train_time_seconds": 542.3088885319885,
+    "valid_time_seconds": 31.797034192830324,
+    "total_time_seconds": 574.1061695348471,
+    "train_time_formatted": "9 minutes and 2.31 seconds",
+    "valid_time_formatted": "31.8 seconds",
+    "total_time_formatted": "9 minutes and 34.11 seconds"
+  },
+  {
+    "epoch": 23,
+    "train_time_seconds": 541.7323718850967,
+    "valid_time_seconds": 32.401844463078305,
+    "total_time_seconds": 574.1345111450646,
+    "train_time_formatted": "9 minutes and 1.73 seconds",
+    "valid_time_formatted": "32.4 seconds",
+    "total_time_formatted": "9 minutes and 34.13 seconds"
+  },
+  {
+    "epoch": 24,
+    "train_time_seconds": 540.4627352480311,
+    "valid_time_seconds": 32.050428641960025,
+    "total_time_seconds": 572.5134268510155,
+    "train_time_formatted": "9 minutes and 0.46 seconds",
+    "valid_time_formatted": "32.05 seconds",
+    "total_time_formatted": "9 minutes and 32.51 seconds"
+  },
+  {
+    "epoch": 25,
+    "train_time_seconds": 541.2109479960054,
+    "valid_time_seconds": 31.98849535989575,
+    "total_time_seconds": 573.1997142769396,
+    "train_time_formatted": "9 minutes and 1.21 seconds",
+    "valid_time_formatted": "31.99 seconds",
+    "total_time_formatted": "9 minutes and 33.2 seconds"
+  },
+  {
+    "epoch": 26,
+    "train_time_seconds": 541.7846705690026,
+    "valid_time_seconds": 32.09942584391683,
+    "total_time_seconds": 573.8843591869809,
+    "train_time_formatted": "9 minutes and 1.78 seconds",
+    "valid_time_formatted": "32.1 seconds",
+    "total_time_formatted": "9 minutes and 33.88 seconds"
+  }
+]

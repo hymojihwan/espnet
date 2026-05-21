@@ -1,0 +1,140 @@
+# JEPA Balanced Frontend for CTC ASR (from scratch, no SpecAugment)
+# This configuration uses JEPA-style self-supervised learning with:
+#   - Context encoder processes all patches (masked with mask token)
+#   - Target encoder is EMA of context encoder
+#   - Predictor predicts target latents from context features
+#   - Target decoder reconstructs clean patches from target latents
+#   - Fixed 2D sincos positional embedding
+#   - Loss: L_align (pred_latents[masked] vs target_latents[masked]) + L_clean_recon (clean_patches_hat[ALL] vs clean_patches[ALL]) + L_unmask (decoded_patches[unmasked] vs clean_patches[unmasked])
+#   - Key differences from jepa_audio:
+#     * clean_recon loss is computed on ALL valid patches, not just masked patches
+#     * unmasked loss is computed on unmasked patches for additional supervision
+# Architecture: 2D patches (time, freq) → Context encoder (all patches) → Predictor → Latents
+# SpecAugment is disabled as JEPA frontend already provides noise robustness through masking
+
+# general
+batch_type: numel
+batch_bins: 24000000
+accum_grad: 16
+max_epoch: 200
+patience: none
+init: none  # No pretrained model initialization
+best_model_criterion:
+-   - valid
+    - wer_ctc
+    - min
+keep_nbest_models: 10
+
+# JEPA Balanced Frontend configuration
+# Outputs mel spectrograms (80-dim, same as jepa_masked)
+frontend: jepa_balanced
+frontend_conf:
+    # Architecture parameters
+    embedding_dim: 256
+    
+    # Patch configuration - 2D patching (time, freq)
+    patch_size: [16, 16]     # (time, freq) - 2D patches
+    mask_ratio: 0.3          # Mask 30% of patches
+    dropout_rate: 0.1
+    
+    # Encoder type and config
+    encoder_type: transformer
+    encoder_conf:
+        num_layers: 2
+        num_heads: 8
+        ff_dim: 512
+        dropout_rate: 0.1
+        attn_dropout_rate: 0.1
+        use_positional_encoding: true  # Additional PE on top of fixed 2D sincos
+    
+    # Predictor type and config (predicts target latents)
+    # Predictor size should be half of encoder's
+    predictor_type: transformer
+    predictor_conf:
+        num_layers: 1        # Half of encoder layers
+        num_heads: 8
+        ff_dim: 512
+        dropout_rate: 0.1
+        attn_dropout_rate: 0.1
+        use_positional_encoding: true  # Additional PE on top of fixed 2D sincos
+    
+    # Decoder type and config (target decoder for clean reconstruction)
+    # MLP decoder is sufficient for simple patch reconstruction
+    decoder_type: mlp
+    decoder_conf:
+        num_layers: 1
+        hidden_dim: 256
+        dropout_rate: 0.1
+    
+    # Audio processing parameters (same as baseline)
+    n_fft: 512
+    hop_length: 128
+    win_length: 512
+    fs: 16000
+    n_mels: 80
+    
+    # Training parameters
+    embedding_loss_weight: 1.0  # Weight for L_align and L_clean_recon
+    unmask_loss_weight: 0.1    # Weight for L_unmask (unmasked patches reconstruction loss)
+                                # Start with 0.1, can increase to 0.3~1.0 if stable
+    ema_decay: 0.999           # EMA decay rate for target encoder
+
+# Pre-encoder: Not needed - JEPA balanced frontend outputs mel spectrograms directly
+preencoder: null
+preencoder_conf: {}
+
+# Encoder: Conformer (trained from scratch, same as standard CTC)
+# Input is mel spectrogram (80-dim, same as jepa_masked)
+encoder: conformer
+encoder_conf:
+    output_size: 256
+    attention_heads: 4
+    linear_units: 1024
+    num_blocks: 18
+    dropout_rate: 0.1
+    positional_dropout_rate: 0.1
+    attention_dropout_rate: 0.1
+    input_layer: conv2d  # Input is mel spectrogram, same as jepa_masked
+    normalize_before: true
+    macaron_style: true
+    rel_pos_type: latest
+    pos_enc_layer_type: rel_pos
+    selfattention_layer_type: rel_selfattn
+    activation_type: swish
+    use_cnn_module: true
+    cnn_module_kernel: 31
+
+# CTC model configuration (standard CTC, no progressive schedule needed)
+model_conf:
+    ctc_weight: 1.0
+    lsm_weight: 0.1
+    length_normalized_loss: false
+    report_cer: True
+    report_wer: True
+
+# Decoder: None (CTC-only mode)
+decoder: null
+decoder_conf: {}
+
+# optimizer (adjusted for faster convergence)
+optim: adam
+optim_conf:
+    lr: 0.003  # Increased from 0.002 for faster convergence
+    weight_decay: 0.0001
+scheduler: warmuplr
+scheduler_conf:
+    warmup_steps: 10000  # Reduced from 15000 for faster warmup
+
+num_att_plot: 0
+
+# SpecAugment: Disabled for JEPA training
+# JEPA balanced frontend already provides noise robustness through masking/denoising,
+# so SpecAugment is not needed
+specaug: null
+specaug_conf: {}
+
+# Normalization: Use global MVN (same as standard CTC training)
+normalize: global_mvn
+normalize_conf:
+    stats_file: exp/asr_stats_raw_en_bpe2048/train/feats_stats.npz
+

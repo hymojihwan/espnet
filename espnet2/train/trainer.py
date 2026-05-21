@@ -2,6 +2,7 @@
 
 import argparse
 import dataclasses
+import json
 import logging
 import time
 from contextlib import contextmanager
@@ -294,7 +295,13 @@ class Trainer:
             train_summary_writer = None
 
         start_time = time.perf_counter()
+        # Initialize epoch timing tracking
+        epoch_times = []
+        epoch_times_file = output_dir / "epoch_times.json"
+        
         for iepoch in range(start_epoch, trainer_options.max_epoch + 1):
+            epoch_start_time = time.perf_counter()
+            
             if iepoch != start_epoch:
                 logging.info(
                     "{}/{}epoch started. Estimated time to finish: {}".format(
@@ -313,6 +320,7 @@ class Trainer:
 
             reporter.set_epoch(iepoch)
             # 1. Train and validation for one-epoch
+            train_start_time = time.perf_counter()
             with reporter.observe("train") as sub_reporter:
                 all_steps_are_invalid = cls.train_one_epoch(
                     model=dp_model,
@@ -325,7 +333,9 @@ class Trainer:
                     options=trainer_options,
                     distributed_option=distributed_option,
                 )
+            train_time = time.perf_counter() - train_start_time
 
+            valid_start_time = time.perf_counter()
             with reporter.observe("valid") as sub_reporter:
                 cls.validate_one_epoch(
                     model=dp_model,
@@ -334,6 +344,33 @@ class Trainer:
                     options=trainer_options,
                     distributed_option=distributed_option,
                 )
+            valid_time = time.perf_counter() - valid_start_time
+            
+            epoch_time = time.perf_counter() - epoch_start_time
+            
+            # Log epoch timing information
+            logging.info(
+                f"Epoch {iepoch} timing - "
+                f"Train: {humanfriendly.format_timespan(train_time)}, "
+                f"Valid: {humanfriendly.format_timespan(valid_time)}, "
+                f"Total: {humanfriendly.format_timespan(epoch_time)}"
+            )
+            
+            # Store epoch timing data
+            epoch_times.append({
+                "epoch": iepoch,
+                "train_time_seconds": train_time,
+                "valid_time_seconds": valid_time,
+                "total_time_seconds": epoch_time,
+                "train_time_formatted": humanfriendly.format_timespan(train_time),
+                "valid_time_formatted": humanfriendly.format_timespan(valid_time),
+                "total_time_formatted": humanfriendly.format_timespan(epoch_time),
+            })
+            
+            # Save epoch times to file (only on rank 0 in distributed training)
+            if not distributed_option.distributed or distributed_option.dist_rank == 0:
+                with open(epoch_times_file, "w") as f:
+                    json.dump(epoch_times, f, indent=2)
             if not distributed_option.distributed or distributed_option.dist_rank == 0:
                 # att_plot doesn't support distributed
                 if plot_attention_iter_factory is not None:
@@ -754,6 +791,12 @@ class Trainer:
                                 optimizer.step()
                             if isinstance(scheduler, AbsBatchStepScheduler):
                                 scheduler.step()
+                        # Keep JEPA target encoder in sync with online encoder.
+                        # Update once per optimizer step if the frontend supports EMA update.
+                        core_model = model.module if hasattr(model, "module") else model
+                        frontend = getattr(core_model, "frontend", None)
+                        if frontend is not None and hasattr(frontend, "update_target_encoder"):
+                            frontend.update_target_encoder()
                 for iopt, optimizer in enumerate(optimizers):
                     if optim_idx is not None and iopt != optim_idx:
                         continue

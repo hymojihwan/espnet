@@ -72,6 +72,7 @@ use_dereverb_ref=false
 use_noise_ref=false
 variable_num_refs=false # Whether to use variable numbers of references in spk1.scp, dereverb1.scp, enroll_spk1.scp, etc.
 extra_wav_list= # Extra list of scp files for wav formatting
+format_wav_scp_skip_bad_files=false # If true, skip missing/unreadable WAVs in format_wav_scp instead of failing
 
 # Pretrained model related
 # The number of --init_param must be same.
@@ -164,6 +165,7 @@ Options:
                           for training a denoising model (default="${use_noise_ref}")
     --variable_num_refs # Whether or not to use variable numbers of references in spk1.scp, dereverb1.scp, enroll_spk1.scp, etc. If True, --ref_num and --dereverb_ref_num must be 1. (default="${variable_num_refs}")
     --extra_wav_list    # Extra list of scp files for wav formatting (default="${extra_wav_list}")
+    --format_wav_scp_skip_bad_files # Skip missing/unreadable WAVs in format_wav_scp (default="${format_wav_scp_skip_bad_files}")
 
     # Pretrained model related
     --init_param    # pretrained model path and module name (default="${init_param}")
@@ -383,6 +385,9 @@ if ! "${skip_data_prep}"; then
                 # Where the time is written in seconds.
                 _opts+="--segments data/${dset}/segments "
             fi
+            if "${format_wav_scp_skip_bad_files}"; then
+                _opts+="--skip_bad_files true "
+            fi
 
 
             _spk_list=" "
@@ -445,6 +450,15 @@ if ! "${skip_data_prep}"; then
             for f in ${utt_extra_files}; do
                 [ -f data/${dset}/${f} ] && cp data/${dset}/${f} ${data_feats}${_suf}/${dset}/${f}
             done
+
+            # When some WAVs were skipped, prune utt2spk etc. to match wav.scp
+            if "${format_wav_scp_skip_bad_files}"; then
+                _fix_scp_list="wav.scp"
+                for spk in ${_spk_list}; do
+                    _fix_scp_list="${_fix_scp_list} ${spk}.scp"
+                done
+                utils/fix_data_dir.sh --utt_extra_files "${_fix_scp_list} ${utt_extra_files}" "${data_feats}${_suf}/${dset}"
+            fi
 
         done
     fi

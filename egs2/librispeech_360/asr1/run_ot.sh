@@ -10,7 +10,7 @@ valid_set="dev"
 test_sets="test_clean test_other"
 
 asr_task="asr_ot_transducer"
-asr_config=conf/tuning/transducer/OT/conformer-rnnt-ot-streaming.yaml
+asr_config=conf/tuning/transducer/OT/conformer-rnnt-ot.yaml
 inference_config=conf/tuning/transducer/decode_transducer.yaml
 inference_asr_model=valid.loss.ave_10best.pth
 

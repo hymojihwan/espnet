@@ -1,0 +1,133 @@
+# JEPA (Joint Embedding Predictive Architecture) Frontend for CTC ASR
+# This configuration uses JEPA-based frontend for noise-robust CTC training
+
+# Model type: Use JEPA-specific ASR model (default is jepa_espnet)
+# model: jepa_espnet
+
+# general
+batch_type: numel
+batch_bins: 24000000
+accum_grad: 16
+max_epoch: 100
+patience: none
+init: none
+# Load pretrained CTC model (encoder, ctc)
+# Exclude frontend and normalize to train only JEPA frontend
+# Note: Preencoder is null (JEPA frontend directly outputs 80-dim)
+#       Normalize is reinitialized with stats_file (80-dim log-mel stats) and frozen (fixed stats)
+#       SpecAug is disabled (null) for JEPA training
+# Format: <file_path>:<src_key>:<dst_key>:<exclude_keys>
+# Note: ESPnetJEPAASRModel doesn't have 'model' wrapper, so we load directly
+init_param:
+  - ../../librispeech/asr1/exp/asr_train_conformer_ctc_raw_en_bpe2048/valid.wer_ctc.ave_10best.pth:model.encoder:encoder
+  - ../../librispeech/asr1/exp/asr_train_conformer_ctc_raw_en_bpe2048/valid.wer_ctc.ave_10best.pth:model.ctc:ctc
+ignore_init_mismatch: true
+# Freeze encoder, ctc, and normalize
+# Note: Frontend is NOT frozen to learn JEPA representations (outputs 80-dim directly)
+#       Preencoder is null (not needed - JEPA frontend outputs 80-dim)
+#       Normalize (global_mvn) uses fixed stats - will be recomputed from JEPA embeddings during stats collection
+#       SpecAug is disabled (null)
+freeze_param:
+  - encoder
+  - ctc
+  - normalize
+best_model_criterion:
+-   - valid
+    - wer_ctc
+    - min
+keep_nbest_models: 10
+
+# JEPA Frontend configuration
+# Note: Audio processing parameters must match the pretrained model's default frontend
+# Default frontend uses: n_fft=512, hop_length=128, n_mels=80, fs=16k
+# JEPA embedding_dim is set to 80 to directly match encoder input (no preencoder needed)
+frontend: jepa
+frontend_conf:
+    # JEPA architecture parameters
+    embedding_dim: 80  # Match encoder input dimension (log-mel: 80) - no preencoder needed
+    predictor_dim: 256
+    num_predictor_layers: 2
+    dropout_rate: 0.1
+    # Audio processing parameters (must match pretrained model's default frontend)
+    n_fft: 512
+    hop_length: 128  # Match default frontend (was 256, but pretrained uses 128)
+    win_length: 512
+    fs: 16000
+    n_mels: 80  # Match default frontend's log-mel dimension
+    # Noise reduction parameters
+    noise_reduction_weight: 1.0
+    embedding_loss_weight: 50.0  # JEPA loss weight (increased to balance with CTC loss scale ~2700)
+    # EMA for target encoder (standard JEPA: 0.999)
+    ema_decay: 0.999
+    # Mask ratio for predictive coding (standard JEPA: 0.3)
+    mask_ratio: 0.3
+
+# Pre-encoder: Not needed - JEPA frontend directly outputs 80-dim to match encoder input
+preencoder: null
+preencoder_conf: {}
+
+# Encoder: Conformer
+encoder: conformer
+encoder_conf:
+    output_size: 256
+    attention_heads: 4
+    linear_units: 1024
+    num_blocks: 18
+    dropout_rate: 0.1
+    positional_dropout_rate: 0.1
+    attention_dropout_rate: 0.1
+    input_layer: conv2d
+    normalize_before: true
+    macaron_style: true
+    rel_pos_type: latest
+    pos_enc_layer_type: rel_pos
+    selfattention_layer_type: rel_selfattn
+    activation_type: swish
+    use_cnn_module: true
+    cnn_module_kernel: 31
+
+# CTC model configuration
+# Note: For JEPA training, we combine JEPA loss (representation learning) with CTC loss (ASR task)
+#       Progressive CTC weight: start small (0.01), gradually increase to 1.0 over warmup_steps
+#       This allows JEPA representation learning first, then gradually incorporates CTC learning
+#       ctc_weight < 1.0 requires decoder, but we set decoder=null, so we need ctc_weight=1.0 for model structure
+#       The effective CTC weight is calculated dynamically in the model forward pass
+#       The final loss = jepa_weight * loss_jepa + effective_ctc_weight * loss_ctc
+model_conf:
+    ctc_weight: 1.0  # Set to 1.0 to allow decoder=None (CTC-only mode), but will be scaled dynamically in forward
+    ctc_weight_start: 0.01  # Initial CTC weight (focus on JEPA learning)
+    ctc_weight_end: 1.0  # Final CTC weight (full CTC learning)
+    ctc_weight_warmup_steps: 10000  # Number of steps to gradually increase CTC weight from start to end
+    lsm_weight: 0.1
+    length_normalized_loss: false
+    report_cer: True
+    report_wer: True
+
+# Decoder: None (CTC-only mode)
+decoder: null
+decoder_conf: {}
+
+# optimizer
+optim: adam
+optim_conf:
+    lr: 0.001  # Reduced learning rate for more stable training
+    weight_decay: 0.000001
+scheduler: warmuplr
+scheduler_conf:
+    warmup_steps: 15000
+
+num_att_plot: 0
+
+# SpecAugment: Disabled for JEPA training
+# JEPA frontend provides noise robustness, and specaug is not needed
+specaug: null
+specaug_conf: {}
+
+# Normalization: JEPA frontend outputs learned embeddings (not log-mel)
+# Use global_mvn but stats will be computed from JEPA embeddings during stats collection stage
+# Note: Stats file path will be set during training (asr_stats_raw_en_bpe2048/train/feats_stats.npz)
+#       But the actual stats will be computed from JEPA embeddings, not log-mel
+normalize: global_mvn
+normalize_conf:
+    stats_file: ../../librispeech/asr1/exp/asr_stats_raw_en_bpe2048/train/feats_stats.npz
+

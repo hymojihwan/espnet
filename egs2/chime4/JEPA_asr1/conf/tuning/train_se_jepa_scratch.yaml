@@ -1,0 +1,121 @@
+# SE-JEPA ASR for CHiME4: Conv-TasNet (SI-SNR) + JEPA predictive + Conformer CTC
+# Flow: Noisy wav → SE(Conv-TasNet) → enhanced wav → log-mel → JEPA predictive → Conformer → CTC
+# Loss = se_loss_weight * SI-SNR + jepa_weight * JEPA + ctc_weight * CTC
+
+# general
+batch_type: numel
+batch_bins: 2500000
+accum_grad: 64
+max_epoch: 200
+patience: none
+init: none
+best_model_criterion:
+-   - valid
+    - wer_ctc
+    - min
+keep_nbest_models: 10
+
+# SE-JEPA Frontend: Conv-TasNet (SI-SNR) + JEPA predictive
+frontend: se_jepa
+frontend_conf:
+    jepa_frontend_conf:
+        embedding_dim: 256
+        patch_size: [16, 16]
+        mask_ratio: 0.3
+        dropout_rate: 0.1
+        encoder_type: transformer
+        encoder_conf:
+            num_layers: 2
+            num_heads: 8
+            ff_dim: 256
+            dropout_rate: 0.1
+            attn_dropout_rate: 0.1
+            use_positional_encoding: true
+        predictor_type: transformer
+        predictor_conf:
+            num_layers: 1
+            num_heads: 8
+            ff_dim: 256
+            dropout_rate: 0.1
+            attn_dropout_rate: 0.1
+            use_positional_encoding: true
+        decoder_type: mlp
+        decoder_conf:
+            num_layers: 1
+            hidden_dim: 256
+            dropout_rate: 0.1
+        n_fft: 512
+        hop_length: 128
+        win_length: 512
+        fs: 16000
+        n_mels: 80
+        embedding_loss_weight: 1.0
+        ema_decay: 0.999
+
+    use_asteroid_convtasnet: true
+    convtasnet_n_src: 1
+    convtasnet_n_filters: 128
+    convtasnet_kernel_size: 16
+    convtasnet_stride: 8
+    convtasnet_n_blocks: 4
+    convtasnet_n_repeats: 2
+    convtasnet_bn_chan: 32
+    convtasnet_hid_chan: 128
+    convtasnet_skip_chan: 32
+    convtasnet_conv_kernel_size: 3
+
+preencoder: null
+preencoder_conf: {}
+
+encoder: conformer
+encoder_conf:
+    output_size: 256
+    attention_heads: 4
+    linear_units: 1024
+    num_blocks: 18
+    dropout_rate: 0.1
+    positional_dropout_rate: 0.1
+    attention_dropout_rate: 0.1
+    input_layer: conv2d
+    normalize_before: true
+    macaron_style: true
+    rel_pos_type: latest
+    pos_enc_layer_type: rel_pos
+    selfattention_layer_type: rel_selfattn
+    activation_type: swish
+    use_cnn_module: true
+    cnn_module_kernel: 31
+
+model: se_jepa_espnet
+model_conf:
+    ctc_weight: 1.0
+    lsm_weight: 0.1
+    length_normalized_loss: false
+    report_cer: true
+    report_wer: true
+    se_loss_weight: 0.5
+    encoder_distill_weight: 0.05
+    ctc_weight_start: 0.2
+    ctc_weight_end: 1.0
+    ctc_weight_warmup_steps: 5000
+
+decoder: null
+decoder_conf: {}
+
+optim: adam
+optim_conf:
+    lr: 0.003
+    weight_decay: 0.0001
+scheduler: warmuplr
+scheduler_conf:
+    warmup_steps: 10000
+
+num_att_plot: 0
+
+specaug: null
+specaug_conf: {}
+
+normalize: global_mvn
+normalize_conf:
+    # asr.sh will create stats under exp/asr_stats_*/<train_set>/feats_stats.npz
+    stats_file: exp/asr_stats_raw_en_bpe2048/tr05_multi_isolated_1ch_track/feats_stats.npz

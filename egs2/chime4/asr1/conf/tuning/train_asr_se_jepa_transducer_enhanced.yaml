@@ -1,0 +1,88 @@
+# SE + JEPA + ASR on top of pre-enhanced waveforms.
+# Acoustic path: enhanced wav -> frontend log-mel -> mel refiner
+# Auxiliary: self-distillation JEPA on masked refined mel features
+# ASR path: refined mel -> standard RNNT encoder/decoder/joint
+
+model: se_jepa
+
+batch_type: numel
+batch_bins: 3200000
+accum_grad: 8
+max_epoch: 100
+patience: none
+init: none
+num_att_plot: 0
+
+val_scheduler_criterion:
+  - valid
+  - loss
+best_model_criterion:
+  - - valid
+    - loss
+    - min
+keep_nbest_models: 10
+
+model_conf:
+  transducer_weight: 1.0
+  auxiliary_ctc_weight: 0.0
+  report_cer: true
+  report_wer: true
+  se_hidden_size: 256
+  se_dropout_rate: 0.1
+  jepa_loss_weight: 0.1
+  jepa_mask_prob: 0.3
+  jepa_mask_span: 4
+  jepa_hidden_size: 256
+  jepa_predictor_hidden_size: 512
+
+encoder_conf:
+  main_conf:
+    pos_wise_act_type: swish
+    conv_mod_act_type: swish
+    pos_enc_dropout_rate: 0.2
+    dynamic_chunk_training: false
+    short_chunk_threshold: 0.75
+    short_chunk_size: 25
+    num_left_chunks: 4
+  input_conf:
+    vgg_like: true
+  body_conf:
+    - block_type: conformer
+      linear_size: 2048
+      hidden_size: 512
+      heads: 8
+      dropout_rate: 0.1
+      pos_wise_dropout_rate: 0.1
+      att_dropout_rate: 0.1
+      conv_mod_kernel_size: 31
+      num_blocks: 12
+
+decoder: rnn
+decoder_conf:
+  rnn_type: lstm
+  num_layers: 1
+  embed_size: 512
+  hidden_size: 512
+  dropout_rate: 0.1
+  embed_dropout_rate: 0.2
+
+joint_network_conf:
+  joint_space_size: 512
+
+frontend: default
+specaug: null
+specaug_conf: {}
+normalize: utterance_mvn
+normalize_conf: {}
+
+seed: 2022
+use_amp: false
+num_workers: 4
+
+optim: adam
+optim_conf:
+  lr: 0.001
+  weight_decay: 0.000001
+scheduler: warmuplr
+scheduler_conf:
+  warmup_steps: 15000

@@ -119,6 +119,14 @@ class MultiHeadedAttention(nn.Module):
 
         return q, k, v
 
+    @staticmethod
+    def _unpad_input_compat(x, nonpad_mask):
+        result = unpad_input(x, nonpad_mask)
+        if isinstance(result, tuple) and len(result) == 5:
+            x_unpad, indices, cu_seqlens, max_seqlen, _ = result
+            return x_unpad, indices, cu_seqlens, max_seqlen
+        return result
+
     def forward_attention(self, value, scores, mask):
         """Compute attention context vector.
 
@@ -203,13 +211,13 @@ class MultiHeadedAttention(nn.Module):
                     query_nonpad_mask = key_nonpad_mask
 
                 if key_nonpad_mask.eq(0).any():
-                    q, indices_q, cu_seqlens_q, max_seqlen_q = unpad_input(
+                    q, indices_q, cu_seqlens_q, max_seqlen_q = self._unpad_input_compat(
                         query, query_nonpad_mask
                     )
-                    k, indices_k, cu_seqlens_k, max_seqlen_k = unpad_input(
+                    k, indices_k, cu_seqlens_k, max_seqlen_k = self._unpad_input_compat(
                         key, key_nonpad_mask
                     )
-                    v, _, _, _ = unpad_input(value, key_nonpad_mask)
+                    v, _, _, _ = self._unpad_input_compat(value, key_nonpad_mask)
 
                     q = self.linear_q(q).reshape(-1, self.h, self.d_k)
                     k = self.linear_k(k).reshape(-1, self.h, self.d_k)
@@ -239,7 +247,6 @@ class MultiHeadedAttention(nn.Module):
                 else:
                     del key_nonpad_mask
                     q, k, v = self.forward_qkv(query, key, value)
-                    del query, key, value
 
                     out = flash_attn_func(
                         q.transpose(1, 2),

@@ -55,6 +55,7 @@ from espnet2.asr.espnet_model import ESPnetASRModel
 from espnet2.asr.frontend.abs_frontend import AbsFrontend
 from espnet2.asr.frontend.default import DefaultFrontend
 from espnet2.asr.frontend.fused import FusedFrontends
+from espnet2.asr.frontend.jepa import JEPAFrontend
 from espnet2.asr.frontend.s3prl import S3prlFrontend
 from espnet2.asr.frontend.whisper import WhisperFrontend
 from espnet2.asr.frontend.windowing import SlidingWindow
@@ -97,6 +98,7 @@ frontend_choices = ClassChoices(
         sliding_window=SlidingWindow,
         s3prl=S3prlFrontend,
         fused=FusedFrontends,
+        jepa=JEPAFrontend,
         whisper=WhisperFrontend,
     ),  # If setting this to none, please make sure to provide input_size in the config.
     type_check=AbsFrontend,

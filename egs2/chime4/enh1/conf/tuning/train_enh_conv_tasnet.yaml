@@ -2,7 +2,7 @@ optim: adam
 init: xavier_uniform
 max_epoch: 100
 batch_type: folded
-batch_size: 8
+batch_size: 32
 iterator_type: chunk
 chunk_length: 32000
 num_workers: 4
@@ -10,7 +10,7 @@ optim_conf:
     lr: 1.0e-03
     eps: 1.0e-08
     weight_decay: 1.0e-05
-patience: 4
+patience: 10
 val_scheduler_criterion:
 - valid
 - loss
@@ -26,7 +26,7 @@ scheduler: reducelronplateau
 scheduler_conf:
     mode: min
     factor: 0.5
-    patience: 3
+    patience: 5
 encoder: conv
 encoder_conf:
     channel: 256

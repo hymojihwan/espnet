@@ -193,60 +193,37 @@ class ESPnetASRTransducerModel(AbsESPnetModel):
         batch_size = speech.shape[0]
         text = text[:, : text_lengths.max()]
 
-        # 103-1240-0006 AS AVONLEA HOUSEKEEPERS WERE WONT TO TELL IN AWED VOICES AND KEEPING A SHARP EYE ON THE MAIN ROAD THAT CROSSED THE HOLLOW AND WOUND UP THE STEEP RED HILL BEYOND
-        target_utt = "103-1240-0006"
-        # 103-1240-0026 AND HERE SHE SAT NOW KNITTING AND THE TABLE BEHIND HER WAS LAID FOR SUPPER MISSUS RACHEL BEFORE SHE HAD FAIRLY CLOSED THE DOOR
-        # target_utt = "103-1240-0026"
-        if target_utt not in utt_id:
-            with torch.no_grad():
-                loss = torch.zeros([], device=speech.device, requires_grad=True)
-                stats = {}
-                weight = torch.ones(1, device=speech.device)
-            return loss, stats, weight
-        self.eval()  
-        print("target_utt", target_utt)
-        
-        idx = utt_id.index(target_utt)
+        # 1. Encoder
+        encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
 
-        with torch.no_grad():
-            # 1. Encoder
-            encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
+        # 2. Transducer-related I/O preparation
+        decoder_in, target, t_len, u_len = get_transducer_task_io(
+            text,
+            encoder_out_lens,
+            ignore_id=self.ignore_id,
+        )
 
-            # 2. Transducer-related I/O preparation
-            decoder_in, target, t_len, u_len = get_transducer_task_io(
-                text,
-                encoder_out_lens,
-                ignore_id=self.ignore_id,
+        # 3. Decoder
+        self.decoder.set_device(encoder_out.device)
+        decoder_out = self.decoder(decoder_in)
+
+        # 4. Joint Network and RNNT loss computation
+        if self.use_k2_pruned_loss:
+            loss_trans, _, _ = self._calc_k2_transducer_pruned_loss(
+                encoder_out, decoder_out, text, t_len, u_len, **self.k2_pruned_loss_args
+            )
+        else:
+            joint_out = self.joint_network(
+                encoder_out.unsqueeze(2), decoder_out.unsqueeze(1)
             )
 
-            # 3. Decoder
-            self.decoder.set_device(encoder_out.device)
-            decoder_out = self.decoder(decoder_in)
-            
-
-            # 4. Joint Network and RNNT loss computation
-            if self.use_k2_pruned_loss:
-                loss_trans, joint_out, k2_joint_out = self._calc_k2_transducer_pruned_loss(
-                    encoder_out, decoder_out, text, t_len, u_len, **self.k2_pruned_loss_args
-                )
-                # k2에서는 am + lm로 만든 joint output 사용
-                self.extract_alignment_k2(k2_joint_out[idx], text[idx], t_len[idx].item(), u_len[idx].item(), target_utt)
-                exit()
-            else:
-                joint_out = self.joint_network(
-                    encoder_out.unsqueeze(2), decoder_out.unsqueeze(1)
-                )
-
-                self.extract_alignment(joint_out[idx], text[idx], t_len[idx].item(), u_len[idx].item(), target_utt)
-                exit()
-
-                loss_trans = self._calc_transducer_loss(
-                    encoder_out,
-                    joint_out,
-                    target,
-                    t_len,
-                    u_len,
-                )
+            loss_trans = self._calc_transducer_loss(
+                encoder_out,
+                joint_out,
+                target,
+                t_len,
+                u_len,
+            )
 
         # 5. Auxiliary losses
         loss_ctc, loss_lm = 0.0, 0.0
@@ -565,8 +542,8 @@ class ESPnetASRTransducerModel(AbsESPnetModel):
             feats, feats_lengths = self._extract_feats(speech, speech_lengths)
 
             # 2. Data augmentation
-            # if self.specaug is not None and self.training:
-            #     feats, feats_lengths = self.specaug(feats, feats_lengths)
+            if self.specaug is not None and self.training:
+                feats, feats_lengths = self.specaug(feats, feats_lengths)
 
             # 3. Normalization for feature: e.g. Global-CMVN, Utterance-CMVN
             if self.normalize is not None:
@@ -672,6 +649,7 @@ class ESPnetASRTransducerModel(AbsESPnetModel):
         loss_type: str = "regular",
         reduction: str = "mean",
         padding_idx: int = 0,
+        return_px_grad: bool = False,
     ) -> torch.Tensor:
         """Compute k2 pruned Transducer loss.
 
@@ -786,6 +764,8 @@ class ESPnetASRTransducerModel(AbsESPnetModel):
             simple_loss_scaling * simple_loss + pruned_loss_scaling * pruned_loss
         )
 
+        if return_px_grad:
+            return loss_transducer, joint_out, k2_joint_out, px_grad
         return loss_transducer, joint_out, k2_joint_out
 
     def _calc_ctc_loss(

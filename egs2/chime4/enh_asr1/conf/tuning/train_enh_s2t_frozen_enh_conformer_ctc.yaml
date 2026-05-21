@@ -1,0 +1,122 @@
+# Enh (Conv-TasNet-style per chime4 enh1 train_enh_conv_tasnet.yaml) + Conformer CTC ASR.
+# Enh weights: load from ../enh1/exp/enh_train_enh_conv_tasnet_raw/valid.loss.ave_1best.pth via run script --init_param.
+# Train only ASR: model_conf.enh_frontend_no_grad + --freeze_param enh_model
+#
+# Note: enh1 recipe file is named conv_tasnet but uses separator: tcn — keep architecture identical for weight load.
+
+subtask_series: [enh, asr]
+
+model_conf:
+  calc_enh_loss: false
+  enh_frontend_no_grad: true
+  bypass_enh_prob: 0.0
+
+enh_model_conf:
+  loss_type: si_snr
+
+enh_encoder: conv
+enh_encoder_conf:
+  channel: 256
+  kernel_size: 20
+  stride: 10
+enh_decoder: conv
+enh_decoder_conf:
+  channel: 256
+  kernel_size: 20
+  stride: 10
+enh_separator: tcn
+enh_separator_conf:
+  num_spk: 1
+  layer: 8
+  stack: 4
+  bottleneck_dim: 256
+  hidden_dim: 512
+  kernel: 3
+  causal: false
+  norm_type: "gLN"
+  nonlinear: relu
+
+enh_criterions:
+  - name: si_snr
+    conf:
+      eps: 1.0e-7
+    wrapper: fixed_order
+    wrapper_conf:
+      weight: 1.0
+
+# --- ASR (CTC-only) — aligned with chime4 asr1/train_conformer_ctc.yaml ---
+frontend: default
+
+specaug: null
+specaug_conf: {}
+
+normalize: utterance_mvn
+normalize_conf: {}
+
+asr_preencoder: null
+asr_preencoder_conf: {}
+
+asr_encoder: conformer
+asr_encoder_conf:
+  output_size: 256
+  attention_heads: 4
+  linear_units: 1024
+  num_blocks: 12
+  dropout_rate: 0.1
+  positional_dropout_rate: 0.1
+  attention_dropout_rate: 0.1
+  input_layer: conv2d
+  normalize_before: true
+  macaron_style: true
+  rel_pos_type: latest
+  pos_enc_layer_type: rel_pos
+  selfattention_layer_type: rel_selfattn
+  activation_type: swish
+  use_cnn_module: true
+  cnn_module_kernel: 31
+
+asr_postencoder: null
+asr_postencoder_conf: {}
+
+asr_decoder: null
+
+asr_model_conf:
+  ctc_weight: 1.0
+  lsm_weight: 0.0
+  length_normalized_loss: true
+
+# Training
+optim: adam
+init: none
+max_epoch: 200
+patience: 20
+early_stopping_criterion: [valid, cer_ctc, min]
+# Keep the same full-utterance batching strategy as chime4/asr1.
+# Chunking raw speech while keeping the full transcript causes a severe
+# alignment mismatch for CTC and makes valid CER stagnate or explode.
+batch_type: numel
+batch_bins: 24000000
+accum_grad: 16
+num_workers: 4
+optim_conf:
+  lr: 0.0005
+  eps: 1.0e-08
+  weight_decay: 0.0001
+
+val_scheduler_criterion:
+  - valid
+  - cer_ctc
+best_model_criterion:
+  - - valid
+    - cer_ctc
+    - min
+  - - valid
+    - loss
+    - min
+keep_nbest_models: 10
+
+scheduler: warmuplr
+scheduler_conf:
+  warmup_steps: 25000
+
+num_att_plot: 0

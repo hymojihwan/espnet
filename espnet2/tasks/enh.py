@@ -22,6 +22,9 @@ from espnet2.enh.encoder.conv_encoder import ConvEncoder
 from espnet2.enh.encoder.null_encoder import NullEncoder
 from espnet2.enh.encoder.stft_encoder import STFTEncoder
 from espnet2.enh.espnet_model import ESPnetEnhancementModel
+from espnet2.enh.espnet_k2_asr_prior_model import ESPnetEnhancementK2ASRPriorModel
+from espnet2.enh.espnet_se_jepa_frontend_model import ESPnetSEJEPAFrontendModel
+from espnet2.enh.espnet_se_ot_frontend_model import ESPnetSEOTFrontendModel
 from espnet2.enh.loss.criterions.abs_loss import AbsEnhLoss
 from espnet2.enh.loss.criterions.tf_domain import (
     FrequencyDomainAbsCoherence,
@@ -493,7 +496,7 @@ class EnhancementTask(AbsTask):
         retval += ["dereverb_ref{}".format(n) for n in range(1, MAX_REFERENCE_NUM + 1)]
         retval += ["speech_ref{}".format(n) for n in range(2, MAX_REFERENCE_NUM + 1)]
         retval += ["noise_ref{}".format(n) for n in range(1, MAX_REFERENCE_NUM + 1)]
-        retval += ["category", "fs"]
+        retval += ["category", "fs", "token_int", "token_time_ms", "token_chunk_int"]
         retval = tuple(retval)
         return retval
 
@@ -542,13 +545,25 @@ class EnhancementTask(AbsTask):
             )
 
         else:
-            model = ESPnetEnhancementModel(
+            model_conf = dict(args.model_conf)
+            use_k2_asr_prior = model_conf.get("use_k2_asr_prior", False)
+            use_asr_ot_frontend = model_conf.get("use_asr_ot_frontend", False)
+            use_asr_jepa_frontend = model_conf.get("use_asr_jepa_frontend", False)
+            if use_asr_jepa_frontend:
+                model_class = ESPnetSEJEPAFrontendModel
+            elif use_asr_ot_frontend:
+                model_class = ESPnetSEOTFrontendModel
+            elif use_k2_asr_prior:
+                model_class = ESPnetEnhancementK2ASRPriorModel
+            else:
+                model_class = ESPnetEnhancementModel
+            model = model_class(
                 encoder=encoder,
                 separator=separator,
                 decoder=decoder,
                 loss_wrappers=loss_wrappers,
                 mask_module=mask_module,
-                **args.model_conf,
+                **model_conf,
             )
 
         # FIXME(kamo): Should be done in model?

@@ -249,20 +249,21 @@ class ESPnetASRModel(AbsESPnetModel):
             encoder_out = encoder_out[0]
 
         loss_att, acc_att, cer_att, wer_att = None, None, None, None
-        loss_ctc, cer_ctc = None, None
+        loss_ctc, cer_ctc, wer_ctc = None, None, None
         loss_transducer, cer_transducer, wer_transducer = None, None, None
         loss_classif, acc_classif = None, None
         stats = dict()
 
         # 1. CTC branch
         if self.ctc_weight != 0.0:
-            loss_ctc, cer_ctc = self._calc_ctc_loss(
+            loss_ctc, cer_ctc, wer_ctc = self._calc_ctc_loss(
                 encoder_out, encoder_out_lens, text, text_lengths
             )
 
             # Collect CTC branch stats
             stats["loss_ctc"] = loss_ctc.detach() if loss_ctc is not None else None
             stats["cer_ctc"] = cer_ctc
+            stats["wer_ctc"] = wer_ctc
 
         # Intermediate CTC (optional)
         loss_interctc = 0.0
@@ -599,12 +600,75 @@ class ESPnetASRModel(AbsESPnetModel):
         # Calc CTC loss
         loss_ctc = self.ctc(encoder_out, encoder_out_lens, ys_pad, ys_pad_lens)
 
-        # Calc CER using CTC
-        cer_ctc = None
+        # Calc CER and WER using CTC
+        cer_ctc, wer_ctc = None, None
         if not self.training and self.error_calculator is not None:
             ys_hat = self.ctc.argmax(encoder_out).data
+            # Calculate CER using CTC-specific method
             cer_ctc = self.error_calculator(ys_hat.cpu(), ys_pad.cpu(), is_ctc=True)
-        return loss_ctc, cer_ctc
+            # Calculate WER by converting CTC output to text sequences
+            # Use the same logic as calculate_cer_ctc but convert to text for WER calculation
+            if self.error_calculator.report_wer:
+                from itertools import groupby
+                import numpy as np
+                
+                seqs_hat, seqs_true = [], []
+                for i, y_hat_seq in enumerate(ys_hat.cpu()):
+                    y_true_seq = ys_pad[i].cpu()
+                    
+                    # Limit to actual sequence length for prediction
+                    actual_len = int(encoder_out_lens[i].cpu().item())
+                    y_hat_seq = y_hat_seq[:actual_len]
+                    
+                    # CTC collapse: remove consecutive duplicates (same as calculate_cer_ctc)
+                    y_hat_collapsed = [x[0] for x in groupby(y_hat_seq)]
+                    
+                    # Convert to text, removing blanks (consistent with calculate_cer_ctc)
+                    seq_hat_tokens = []
+                    for idx in y_hat_collapsed:
+                        idx = int(idx)
+                        if idx != -1 and idx != self.error_calculator.idx_blank:
+                            token = self.error_calculator.char_list[idx]
+                            # Preserve space tokens for word segmentation
+                            if idx == self.error_calculator.idx_space:
+                                seq_hat_tokens.append(" ")
+                            else:
+                                seq_hat_tokens.append(token)
+                    
+                    # Convert to text string (preserve spaces for word segmentation)
+                    seq_hat_text = "".join(seq_hat_tokens)
+                    # Normalize spaces: replace space symbol with actual space if needed
+                    if hasattr(self.error_calculator, 'space') and self.error_calculator.space != " ":
+                        seq_hat_text = seq_hat_text.replace(self.error_calculator.space, " ")
+                    
+                    # Convert reference text (same logic as prediction)
+                    eos_true = np.where(y_true_seq.numpy() == -1)[0]
+                    ymax = eos_true[0] if len(eos_true) > 0 else len(y_true_seq)
+                    seq_true_tokens = []
+                    for idx in y_true_seq[:ymax]:
+                        idx = int(idx)
+                        if idx != -1 and idx != self.error_calculator.idx_blank:
+                            token = self.error_calculator.char_list[idx]
+                            # Preserve space tokens for word segmentation
+                            if idx == self.error_calculator.idx_space:
+                                seq_true_tokens.append(" ")
+                            else:
+                                seq_true_tokens.append(token)
+                    
+                    seq_true_text = "".join(seq_true_tokens)
+                    # Normalize spaces
+                    if hasattr(self.error_calculator, 'space') and self.error_calculator.space != " ":
+                        seq_true_text = seq_true_text.replace(self.error_calculator.space, " ")
+                    
+                    seqs_hat.append(seq_hat_text)
+                    seqs_true.append(seq_true_text)
+                
+                # Calculate WER
+                if len(seqs_hat) > 0:
+                    wer_ctc = self.error_calculator.calculate_wer(seqs_hat, seqs_true)
+                else:
+                    wer_ctc = None
+        return loss_ctc, cer_ctc, wer_ctc
 
     def _calc_transducer_loss(
         self,

@@ -97,6 +97,19 @@ def load_pretrained_model(
         obj = get_attr(model, dst_key)
 
     src_state = torch.load(path, map_location=map_location)
+    # Typical ESPnet2 trainer checkpoint: {"model": state_dict, "optimizers": ...}
+    if (
+        isinstance(src_state, dict)
+        and "model" in src_state
+        and isinstance(src_state["model"], dict)
+        and src_key is None
+    ):
+        inner = src_state["model"]
+        if inner:
+            first_v = next(iter(inner.values()))
+            if torch.is_tensor(first_v):
+                src_state = inner
+
     if excludes is not None:
         for e in excludes.split(","):
             src_state = {k: v for k, v in src_state.items() if not k.startswith(e)}

@@ -1,0 +1,111 @@
+# Enhancement + ASR Transducer training configuration with Streaming ConvTasNet
+
+# Training configuration
+max_epoch: 50
+log_interval: 100
+
+# Data configuration
+batch_type: numel
+batch_bins: 2200000
+accum_grad: 16
+grad_clip: 5.0
+log_interval: 100
+
+# Model configuration
+model_conf:
+  enh_weight: 0.3
+  transducer_weight: 1.0
+  freeze_asr: False
+  auxiliary_ctc_weight: 0.0
+  report_cer: True
+  report_wer: True
+
+# Enhancement configuration with Streaming ConvTasNet
+enh_encoder: same  # Use raw waveform directly
+enh_encoder_conf: {}
+
+enh_separator: conv_tasnet_baseline
+enh_separator_conf:
+  # ConvTasNet parameters for streaming
+  num_filters: 512  # Number of filters in autoencoder
+  filter_length: 16  # Length of the filters in autoencoder
+  bottleneck_channels: 128  # Number of channels in bottleneck and residual paths
+  hidden_channels: 512  # Number of channels in convolutional layers
+  kernel_size: 3  # Kernel size in convolutions
+  num_blocks_per_repeat: 6  # Number of convolutional blocks in each repeat
+  num_repeats: 2  # Number of repeats
+  num_speakers: 1  # Number of speakers (single speaker enhancement)
+  num_spk: 1  # Number of speakers (will be handled internally)
+  # Streaming specific parameters
+  causal: true  # Enable causal convolution for streaming
+  streaming: true  # Enable streaming mode
+
+enh_decoder: same  # Use raw waveform directly
+enh_decoder_conf: {}
+
+# Enhancement criterion configuration
+enh_criterion: si_snr
+enh_criterion_conf: {}
+
+normalize: utterance_mvn
+normalize_conf: {}
+
+encoder_conf:
+  main_conf:
+    pos_wise_act_type: swish
+    conv_mod_act_type: swish
+    pos_enc_dropout_rate: 0.2
+    dynamic_chunk_training: True  # Enable dynamic chunk training for streaming
+    short_chunk_threshold: 0.75
+    short_chunk_size: 25
+    num_left_chunks: 4
+  input_conf:
+    vgg_like: True
+  body_conf:
+  - block_type: conformer
+    linear_size: 2048
+    hidden_size: 512
+    heads: 8
+    dropout_rate: 0.1
+    pos_wise_dropout_rate: 0.1
+    att_dropout_rate: 0.1
+    conv_mod_kernel_size: 31
+    num_blocks: 12
+
+decoder: rnn
+decoder_conf:
+  rnn_type: lstm
+  num_layers: 1
+  embed_size: 512
+  hidden_size: 512
+  dropout_rate: 0.1
+  embed_dropout_rate: 0.2
+
+joint_network_conf:
+  joint_space_size: 512
+
+# Training configuration
+optim: adam
+optim_conf:
+  lr: 0.001
+  weight_decay: 0.000001
+
+scheduler: warmuplr
+scheduler_conf:
+  warmup_steps: 15000
+
+val_scheduler_criterion:
+  - valid
+  - loss
+
+best_model_criterion:
+  -   - valid
+      - loss
+      - min
+
+keep_nbest_models: 10
+
+# Token configuration
+token_type: bpe
+token_list: data/token_list/bpe_unigram1000/tokens.txt
+bpemodel: data/token_list/bpe_unigram1000/bpe.model

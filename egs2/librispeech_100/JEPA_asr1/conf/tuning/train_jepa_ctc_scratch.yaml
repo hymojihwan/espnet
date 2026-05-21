@@ -1,0 +1,104 @@
+# JEPA (Joint Embedding Predictive Architecture) Frontend for CTC ASR
+# This configuration trains JEPA model from scratch (no pretrained weights)
+
+# general
+batch_type: numel
+batch_bins: 24000000
+accum_grad: 16
+max_epoch: 100
+patience: none
+init: none  # No pretrained model initialization
+best_model_criterion:
+-   - valid
+    - wer_ctc
+    - min
+keep_nbest_models: 10
+
+# JEPA Frontend configuration
+# JEPA frontend learns noise-robust representations from scratch
+frontend: jepa
+frontend_conf:
+    # JEPA architecture parameters
+    embedding_dim: 80  # Match encoder input dimension (log-mel: 80) - no preencoder needed
+    predictor_dim: 256
+    num_predictor_layers: 2
+    dropout_rate: 0.1
+    # Audio processing parameters
+    n_fft: 512
+    hop_length: 128
+    win_length: 512
+    fs: 16000
+    n_mels: 80  # Match encoder input dimension
+    # Noise reduction parameters
+    noise_reduction_weight: 1.0
+    embedding_loss_weight: 100.0  # Higher JEPA loss weight for scratch training (helps initial learning)
+    # EMA for target encoder (standard JEPA: 0.999)
+    ema_decay: 0.999
+    # Mask ratio for predictive coding (standard JEPA: 0.3)
+    mask_ratio: 0.3
+
+# Pre-encoder: Not needed - JEPA frontend directly outputs 80-dim to match encoder input
+preencoder: null
+preencoder_conf: {}
+
+# Encoder: Conformer (trained from scratch)
+encoder: conformer
+encoder_conf:
+    output_size: 256
+    attention_heads: 4
+    linear_units: 1024
+    num_blocks: 18
+    dropout_rate: 0.1
+    positional_dropout_rate: 0.1
+    attention_dropout_rate: 0.1
+    input_layer: conv2d
+    normalize_before: true
+    macaron_style: true
+    rel_pos_type: latest
+    pos_enc_layer_type: rel_pos
+    selfattention_layer_type: rel_selfattn
+    activation_type: swish
+    use_cnn_module: true
+    cnn_module_kernel: 31
+
+# CTC model configuration
+# For JEPA training from scratch, we combine JEPA loss (representation learning) with CTC loss (ASR task)
+# Progressive CTC weight: start small (0.01), gradually increase to 1.0 over warmup_steps
+# This allows JEPA representation learning first, then gradually incorporates CTC learning
+model_conf:
+    ctc_weight: 1.0  # Set to 1.0 to allow decoder=None (CTC-only mode), but will be scaled dynamically in forward
+    ctc_weight_start: 0.01  # Initial CTC weight (focus on JEPA learning first)
+    ctc_weight_end: 1.0  # Final CTC weight (full CTC learning)
+    ctc_weight_warmup_steps: 15000  # Warmup steps (same as scheduler warmup)
+    lsm_weight: 0.1  # Same as standard CTC training
+    length_normalized_loss: false  # Same as standard CTC training
+    report_cer: True
+    report_wer: True
+
+# Decoder: None (CTC-only mode)
+decoder: null
+decoder_conf: {}
+
+# optimizer (same as standard CTC training)
+optim: adam
+optim_conf:
+    lr: 0.002  # Standard learning rate (same as train_conformer_ctc.yaml)
+    weight_decay: 0.000001
+scheduler: warmuplr
+scheduler_conf:
+    warmup_steps: 15000  # Standard warmup steps (same as train_conformer_ctc.yaml)
+
+num_att_plot: 0
+
+# SpecAugment: Disabled for JEPA training
+# JEPA frontend provides noise robustness, and specaug is not needed
+specaug: null
+specaug_conf: {}
+
+# Normalization: Use global MVN (will be overridden by asr.sh, but stats will be recomputed)
+# Note: asr.sh will override this with --normalize=global_mvn and stats_file
+# For scratch training, we'll use the stats computed from JEPA embeddings
+normalize: global_mvn
+normalize_conf:
+    stats_file: exp/asr_stats_raw_en_bpe2048/train/feats_stats.npz
+

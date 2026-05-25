@@ -18,8 +18,8 @@ model_conf:
 
 frontend: se_jepa
 frontend_conf:
-    se_train_config: exp/enh_train_enh_convtasnet_small_librispeech_raw/config.yaml
-    se_model_file: exp/enh_train_enh_convtasnet_small_librispeech_raw/valid.loss.best.pth
+    se_train_config: exp/enh_train_enh_convtasnet_small_librispeech960_raw/config.yaml
+    se_model_file: exp/enh_train_enh_convtasnet_small_librispeech960_raw/valid.loss.best.pth
     se_no_grad: true
     use_asteroid_convtasnet: true
     convtasnet_n_src: 1

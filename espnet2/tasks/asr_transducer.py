@@ -12,6 +12,7 @@ from espnet2.asr.frontend.abs_frontend import AbsFrontend
 from espnet2.asr.frontend.default import DefaultFrontend
 from espnet2.asr.frontend.frozen_enh import FrozenEnhFrontend
 from espnet2.asr.frontend.frozen_enh_latent import FrozenEnhLatentFrontend
+from espnet2.asr.frontend.se_jepa import SE_JEPAFrontend
 from espnet2.asr.frontend.windowing import SlidingWindow
 from espnet2.asr.specaug.abs_specaug import AbsSpecAug
 from espnet2.asr.specaug.specaug import SpecAug
@@ -60,6 +61,7 @@ frontend_choices = ClassChoices(
         default=DefaultFrontend,
         frozen_enh=FrozenEnhFrontend,
         frozen_enh_latent=FrozenEnhLatentFrontend,
+        se_jepa=SE_JEPAFrontend,
         sliding_window=SlidingWindow,
     ),
     type_check=AbsFrontend,

@@ -84,6 +84,8 @@ class ESPnetASRSEJEPATransducerModel(ESPnetASRTransducerModel):
         jepa_mask_span: int = 4,
         jepa_hidden_size: int = 256,
         jepa_predictor_hidden_size: int = 512,
+        use_model_jepa_modules: bool = True,
+        se_loss_weight: float = 0.0,
         clean_feature_loss_weight: float = 0.0,
         clean_feature_cos_weight: float = 0.25,
         clean_train_scp: Optional[str] = None,
@@ -116,36 +118,42 @@ class ESPnetASRSEJEPATransducerModel(ESPnetASRTransducerModel):
             extract_feats_in_collect_stats=extract_feats_in_collect_stats,
         )
 
-        self.se_refiner = SEMelRefiner(
-            mel_dim=input_size,
-            hidden_size=se_hidden_size,
-            dropout_rate=se_dropout_rate,
-        )
+        self.use_model_jepa_modules = bool(use_model_jepa_modules)
+        if self.use_model_jepa_modules:
+            self.se_refiner = SEMelRefiner(
+                mel_dim=input_size,
+                hidden_size=se_hidden_size,
+                dropout_rate=se_dropout_rate,
+            )
+        else:
+            self.se_refiner = torch.nn.Identity()
         self.jepa_loss_weight = jepa_loss_weight
         self.jepa_mask_prob = jepa_mask_prob
         self.jepa_mask_span = max(1, jepa_mask_span)
-        self.jepa_input_proj = torch.nn.Sequential(
-            torch.nn.LayerNorm(input_size),
-            torch.nn.Linear(input_size, jepa_hidden_size),
-            torch.nn.SiLU(),
-        )
-        self.jepa_projector = torch.nn.Sequential(
-            torch.nn.Linear(jepa_hidden_size, jepa_hidden_size),
-            torch.nn.LayerNorm(jepa_hidden_size),
-            torch.nn.SiLU(),
-            torch.nn.Linear(jepa_hidden_size, jepa_hidden_size),
-        )
-        self.jepa_predictor = torch.nn.Sequential(
-            torch.nn.Linear(jepa_hidden_size, jepa_predictor_hidden_size),
-            torch.nn.SiLU(),
-            torch.nn.Linear(jepa_predictor_hidden_size, jepa_hidden_size),
-        )
-        # Decode JEPA latent back to mel space and optimize masked-region reconstruction.
-        self.jepa_decoder = torch.nn.Sequential(
-            torch.nn.Linear(jepa_hidden_size, jepa_predictor_hidden_size),
-            torch.nn.SiLU(),
-            torch.nn.Linear(jepa_predictor_hidden_size, input_size),
-        )
+        if self.use_model_jepa_modules:
+            self.jepa_input_proj = torch.nn.Sequential(
+                torch.nn.LayerNorm(input_size),
+                torch.nn.Linear(input_size, jepa_hidden_size),
+                torch.nn.SiLU(),
+            )
+            self.jepa_projector = torch.nn.Sequential(
+                torch.nn.Linear(jepa_hidden_size, jepa_hidden_size),
+                torch.nn.LayerNorm(jepa_hidden_size),
+                torch.nn.SiLU(),
+                torch.nn.Linear(jepa_hidden_size, jepa_hidden_size),
+            )
+            self.jepa_predictor = torch.nn.Sequential(
+                torch.nn.Linear(jepa_hidden_size, jepa_predictor_hidden_size),
+                torch.nn.SiLU(),
+                torch.nn.Linear(jepa_predictor_hidden_size, jepa_hidden_size),
+            )
+            # Decode JEPA latent back to mel space and optimize masked-region reconstruction.
+            self.jepa_decoder = torch.nn.Sequential(
+                torch.nn.Linear(jepa_hidden_size, jepa_predictor_hidden_size),
+                torch.nn.SiLU(),
+                torch.nn.Linear(jepa_predictor_hidden_size, input_size),
+            )
+        self.se_loss_weight = float(se_loss_weight)
         self.clean_feature_loss_weight = float(clean_feature_loss_weight)
         self.clean_feature_cos_weight = float(clean_feature_cos_weight)
         self.clean_utt2wav = {}
@@ -343,8 +351,25 @@ class ESPnetASRSEJEPATransducerModel(ESPnetASRTransducerModel):
         batch_size = speech.shape[0]
         text = text[:, : text_lengths.max()]
         utt_ids = kwargs.get("utt_id", None)
+        clean_speech = kwargs.get("clean_speech", None)
+        clean_speech_lengths = kwargs.get("clean_speech_lengths", None)
 
-        feats, feats_lengths = self.encode_features(speech, speech_lengths)
+        # If frontend is SE_JEPAFrontend, pass clean speech so frontend JEPA/SE
+        # objectives are computed on the same forward path as AED/CTC recipes.
+        if self.frontend is not None and hasattr(self.frontend, "jepa_frontend"):
+            with autocast(False):
+                feats, feats_lengths = self.frontend(
+                    speech,
+                    speech_lengths,
+                    clean_input=clean_speech,
+                    clean_input_lengths=clean_speech_lengths,
+                )
+                if self.specaug is not None and self.training:
+                    feats, feats_lengths = self.specaug(feats, feats_lengths)
+                if self.normalize is not None:
+                    feats, feats_lengths = self.normalize(feats, feats_lengths)
+        else:
+            feats, feats_lengths = self.encode_features(speech, speech_lengths)
         refined_feats = self.se_refiner(feats)
         encoder_out, encoder_out_lens = self.encoder(refined_feats, feats_lengths)
 
@@ -379,30 +404,47 @@ class ESPnetASRSEJEPATransducerModel(ESPnetASRTransducerModel):
         if self.use_auxiliary_lm_loss:
             loss_lm = self._calc_lm_loss(decoder_out, target)
 
+        # Prefer frontend JEPA objective when frontend exposes it (SE_JEPAFrontend).
+        # Fallback to model-side masked JEPA objective otherwise.
+        loss_jepa = refined_feats.new_tensor(0.0)
+        jepa_mask_ratio = None
+        used_frontend_jepa = False
+        if self.training and self.jepa_loss_weight > 0.0 and hasattr(self.frontend, "compute_jepa_loss"):
+            frontend_jepa = self.frontend.compute_jepa_loss()
+            if frontend_jepa is not None:
+                loss_jepa = frontend_jepa
+                used_frontend_jepa = True
         clean_feats = None
         clean_feats_lengths = None
-        clean_speech = kwargs.get("clean_speech", None)
-        clean_speech_lengths = kwargs.get("clean_speech_lengths", None)
-        if clean_speech is not None and clean_speech_lengths is not None:
+        need_clean_feats = (
+            self.clean_feature_loss_weight > 0.0
+            or (self.jepa_loss_weight > 0.0 and not used_frontend_jepa)
+        )
+        if need_clean_feats and clean_speech is not None and clean_speech_lengths is not None:
             with torch.no_grad():
                 clean_feats, clean_feats_lengths = self.encode_features(
                     clean_speech, clean_speech_lengths
                 )
-
-        loss_jepa, jepa_mask_ratio = self._calc_jepa_loss(
-            refined_feats,
-            feats_lengths.int(),
-            clean_feats=clean_feats,
-            clean_feats_lengths=(
-                clean_feats_lengths.int() if clean_feats_lengths is not None else None
-            ),
-        )
+        if self.use_model_jepa_modules and (not used_frontend_jepa) and self.jepa_loss_weight > 0.0:
+            loss_jepa, jepa_mask_ratio = self._calc_jepa_loss(
+                refined_feats,
+                feats_lengths.int(),
+                clean_feats=clean_feats,
+                clean_feats_lengths=(
+                    clean_feats_lengths.int() if clean_feats_lengths is not None else None
+                ),
+            )
         loss_clean_refine = self._calc_clean_refine_loss(
             refined_feats=refined_feats,
             speech_lengths=speech_lengths,
             feats_lengths=feats_lengths.int(),
             utt_ids=utt_ids,
         )
+        loss_se = refined_feats.new_tensor(0.0)
+        if self.training and self.se_loss_weight > 0.0 and hasattr(self.frontend, "compute_se_loss"):
+            frontend_se = self.frontend.compute_se_loss()
+            if frontend_se is not None:
+                loss_se = frontend_se
 
         loss = (
             self.transducer_weight * loss_trans
@@ -410,6 +452,7 @@ class ESPnetASRSEJEPATransducerModel(ESPnetASRTransducerModel):
             + self.auxiliary_lm_loss_weight * loss_lm
             + self.jepa_loss_weight * loss_jepa
             + self.clean_feature_loss_weight * loss_clean_refine
+            + self.se_loss_weight * loss_se
         )
 
         if not self.training and (self.report_cer or self.report_wer):
@@ -444,11 +487,14 @@ class ESPnetASRSEJEPATransducerModel(ESPnetASRTransducerModel):
                 if self.clean_feature_loss_weight > 0.0
                 else None
             ),
+            loss_se=loss_se.detach() if self.se_loss_weight > 0.0 else None,
             cer_transducer=cer_transducer,
             wer_transducer=wer_transducer,
             refined_mel_abs=refined_feats.detach().abs().mean(),
             jepa_mask_ratio=(
-                jepa_mask_ratio.detach() if self.jepa_loss_weight > 0.0 else None
+                jepa_mask_ratio.detach()
+                if (self.jepa_loss_weight > 0.0 and jepa_mask_ratio is not None)
+                else None
             ),
         )
 

@@ -108,3 +108,7 @@ else
     echo "$0: Error: Unknown cmd_backend=${cmd_backend}" 1>&2
     return 1
 fi
+
+if [ -n "${ESPNET_CUDA_VISIBLE_DEVICES:-}" ]; then
+    export cuda_cmd="env CUDA_VISIBLE_DEVICES=${ESPNET_CUDA_VISIBLE_DEVICES} ${cuda_cmd}"
+fi

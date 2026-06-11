@@ -119,6 +119,7 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
         center: bool = True,
         normalized: bool = False,
         onesided: bool = True,
+        whisper_compatible_mel: bool = False,
     ):
         # Convert patch_size to tuple if it's a list (from YAML config)
         # This must be done before type checking
@@ -150,25 +151,53 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
         self.predictor_conf = predictor_conf or {}
         self.decoder_type = decoder_type
         self.decoder_conf = decoder_conf or {}
+        self.whisper_compatible_mel = whisper_compatible_mel
 
-        # STFT and Log-Mel transform (same as default frontend)
-        self.stft = Stft(
-            n_fft=n_fft,
-            win_length=win_length,
-            hop_length=hop_length,
-            window=window,
-            center=center,
-            normalized=normalized,
-            onesided=onesided,
-        )
-        self.logmel = LogMel(
-            fs=fs,
-            n_fft=n_fft,
-            n_mels=n_mels,
-            fmin=None,
-            fmax=None,
-            htk=False,
-        )
+        if self.whisper_compatible_mel:
+            try:
+                import whisper
+                from whisper.audio import HOP_LENGTH, N_FFT, N_MELS
+            except Exception as e:
+                raise RuntimeError(
+                    "whisper_compatible_mel requires openai-whisper"
+                ) from e
+
+            expected = (N_FFT, N_FFT, HOP_LENGTH, N_MELS, 16000)
+            configured = (n_fft, win_length, hop_length, n_mels, fs)
+            if configured != expected:
+                raise ValueError(
+                    "Whisper-compatible mel requires "
+                    f"n_fft={N_FFT}, win_length={N_FFT}, "
+                    f"hop_length={HOP_LENGTH}, n_mels={N_MELS}, fs=16000; "
+                    f"got {configured}"
+                )
+            self.register_buffer(
+                "whisper_mel_filters",
+                whisper.audio.mel_filters("cpu", n_mels),
+                persistent=False,
+            )
+            self.stft = None
+            self.logmel = None
+            self.n_fft = n_fft
+            self.win_length = win_length
+        else:
+            self.stft = Stft(
+                n_fft=n_fft,
+                win_length=win_length,
+                hop_length=hop_length,
+                window=window,
+                center=center,
+                normalized=normalized,
+                onesided=onesided,
+            )
+            self.logmel = LogMel(
+                fs=fs,
+                n_fft=n_fft,
+                n_mels=n_mels,
+                fmin=None,
+                fmax=None,
+                htk=False,
+            )
 
         # Context Encoder: Processes unmasked noisy patches
         # Input: flattened patches (B, num_patches, patch_time * patch_freq)
@@ -410,6 +439,32 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
         input_lengths: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Extract log-mel features from audio waveform."""
+        if self.whisper_compatible_mel:
+            window = torch.hann_window(
+                self.win_length, device=input.device, dtype=input.dtype
+            )
+            stft = torch.stft(
+                input,
+                self.n_fft,
+                self.hop_length,
+                window=window,
+                return_complex=True,
+            )
+            magnitudes = stft[..., :-1].abs() ** 2
+            mel_spec = self.whisper_mel_filters.to(magnitudes.dtype) @ magnitudes
+            log_mel = torch.clamp(mel_spec, min=1e-10).log10()
+            log_mel = torch.maximum(
+                log_mel,
+                log_mel.reshape(input.size(0), -1).max(dim=-1)[0][
+                    :, None, None
+                ]
+                - 8.0,
+            )
+            log_mel = (log_mel + 4.0) / 4.0
+            feats_lens = input_lengths // self.hop_length
+            feats_lens = torch.clamp(feats_lens, max=log_mel.size(-1))
+            return log_mel.transpose(1, 2), feats_lens
+
         input_stft, feats_lens = self.stft(input, input_lengths)
         if isinstance(input_stft, torch.Tensor):
             assert input_stft.shape[-1] == 2, f"Expected last dim to be 2, got {input_stft.shape}"

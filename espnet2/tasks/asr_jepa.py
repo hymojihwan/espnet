@@ -50,7 +50,6 @@ frontend_choices = ClassChoices(
         jepa_audio=JEPA_MaskedPatchLatentFrontend,
         jepa_balanced=JEPA_BalancedFrontend,
         jepa_mel_latent=JEPAMelLatentFrontend,
-        frozen_enh=FrozenEnhFrontend,
         se_jepa=SE_JEPAFrontend,
     ),
     type_check=base_frontend_choices.base_type,

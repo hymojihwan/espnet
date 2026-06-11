@@ -43,9 +43,18 @@ class SE_JEPAFrontend(AbsFrontend):
         se_train_config: Optional[str] = None,
         se_model_file: Optional[str] = None,
         se_no_grad: bool = True,
+        observation_addition: bool = False,
+        enhanced_weight: float = 0.8,
+        noisy_weight: float = 0.2,
+        rms_alignment_eps: float = 1.0e-8,
         **kwargs,
     ):
         super().__init__()
+        if enhanced_weight < 0.0 or noisy_weight < 0.0:
+            raise ValueError("Observation-addition weights must be non-negative")
+        if observation_addition and enhanced_weight + noisy_weight <= 0.0:
+            raise ValueError("At least one observation-addition weight must be positive")
+
         if jepa_frontend is not None:
             self.jepa_frontend = jepa_frontend
         elif jepa_frontend_conf is not None:
@@ -56,6 +65,11 @@ class SE_JEPAFrontend(AbsFrontend):
 
         self.se_no_grad = se_no_grad
         self.se_mode = "asteroid"
+        self.observation_addition = observation_addition
+        weight_sum = enhanced_weight + noisy_weight
+        self.enhanced_weight = enhanced_weight / weight_sum
+        self.noisy_weight = noisy_weight / weight_sum
+        self.rms_alignment_eps = rms_alignment_eps
 
         if se_train_config is not None and se_model_file is not None:
             from espnet2.tasks.enh import EnhancementTask
@@ -163,21 +177,47 @@ class SE_JEPAFrontend(AbsFrontend):
         if clean_input is not None and clean_input.dim() >= 2:
             min_len = min(min_len, clean_input.shape[-1])
         enhanced_wav = enhanced_wav[..., :min_len]
+        input_trim = input[..., :min_len]
+        speech_lengths = input_lengths.to(device=enhanced_wav.device, dtype=torch.long)
+        speech_lengths = torch.clamp(speech_lengths, max=min_len)
+
+        if self.observation_addition:
+            sample_ids = torch.arange(min_len, device=enhanced_wav.device)
+            valid_mask = sample_ids.unsqueeze(0) < speech_lengths.unsqueeze(1)
+            valid_mask = valid_mask.to(enhanced_wav.dtype)
+            num_samples = speech_lengths.clamp_min(1).to(enhanced_wav.dtype).unsqueeze(1)
+            enhanced_rms = torch.sqrt(
+                (enhanced_wav.square() * valid_mask).sum(dim=1, keepdim=True)
+                / num_samples
+                + self.rms_alignment_eps
+            )
+            noisy_rms = torch.sqrt(
+                (input_trim.square() * valid_mask).sum(dim=1, keepdim=True)
+                / num_samples
+                + self.rms_alignment_eps
+            )
+            enhanced_wav = enhanced_wav * (noisy_rms / enhanced_rms)
+            enhanced_wav = (
+                self.enhanced_weight * enhanced_wav + self.noisy_weight * input_trim
+            ) * valid_mask
+
+        if clean_input is not None and clean_input.dim() >= 2:
+            clean_for_jepa = clean_input[..., :min_len]
+            clean_lengths_for_jepa = speech_lengths
+        else:
+            clean_for_jepa = clean_input
+            clean_lengths_for_jepa = clean_input_lengths
 
         if self.training:
             self._last_enhanced_wav = enhanced_wav
-            if clean_input is not None:
-                clean_trim = clean_input[..., :min_len] if clean_input.dim() >= 2 else clean_input
-                self._last_clean_wav = clean_trim
-            else:
-                self._last_clean_wav = None
+            self._last_clean_wav = clean_for_jepa
 
         # 2. JEPA: enhanced_wav as "noisy" input, clean_wav as target
         feats, feats_lengths = self.jepa_frontend(
             enhanced_wav,
-            input_lengths,
-            clean_input=clean_input,
-            clean_input_lengths=clean_input_lengths,
+            speech_lengths,
+            clean_input=clean_for_jepa,
+            clean_input_lengths=clean_lengths_for_jepa,
         )
 
         return feats, feats_lengths

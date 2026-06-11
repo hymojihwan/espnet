@@ -35,10 +35,19 @@ class FrozenEnhFrontend(AbsFrontend):
         fmax: Optional[int] = None,
         htk: bool = False,
         enh_no_grad: bool = True,
+        output_waveform: bool = False,
+        observation_addition: bool = False,
+        enhanced_weight: float = 0.8,
+        noisy_weight: float = 0.2,
+        rms_alignment_eps: float = 1.0e-8,
     ):
         super().__init__()
         if isinstance(fs, str):
             fs = humanfriendly.parse_size(fs)
+        if enhanced_weight < 0.0 or noisy_weight < 0.0:
+            raise ValueError("Observation-addition weights must be non-negative")
+        if observation_addition and enhanced_weight + noisy_weight <= 0.0:
+            raise ValueError("At least one observation-addition weight must be positive")
 
         from espnet2.tasks.enh import EnhancementTask
 
@@ -71,8 +80,16 @@ class FrozenEnhFrontend(AbsFrontend):
             htk=htk,
         )
         self.n_mels = n_mels
+        self.output_waveform = output_waveform
+        self.observation_addition = observation_addition
+        weight_sum = enhanced_weight + noisy_weight
+        self.enhanced_weight = enhanced_weight / weight_sum
+        self.noisy_weight = noisy_weight / weight_sum
+        self.rms_alignment_eps = rms_alignment_eps
 
     def output_size(self) -> int:
+        if self.output_waveform:
+            return 1
         return self.n_mels
 
     def _compute_stft(
@@ -109,6 +126,30 @@ class FrozenEnhFrontend(AbsFrontend):
         max_len = enhanced.size(-1)
         speech_lengths = input_lengths.to(device=enhanced.device, dtype=torch.long)
         speech_lengths = torch.clamp(speech_lengths, max=max_len)
+
+        if self.observation_addition:
+            noisy = input[..., :max_len]
+            sample_ids = torch.arange(max_len, device=enhanced.device)
+            valid_mask = sample_ids.unsqueeze(0) < speech_lengths.unsqueeze(1)
+            valid_mask = valid_mask.to(enhanced.dtype)
+            num_samples = speech_lengths.clamp_min(1).to(enhanced.dtype).unsqueeze(1)
+            enhanced_rms = torch.sqrt(
+                (enhanced.square() * valid_mask).sum(dim=1, keepdim=True)
+                / num_samples
+                + self.rms_alignment_eps
+            )
+            noisy_rms = torch.sqrt(
+                (noisy.square() * valid_mask).sum(dim=1, keepdim=True)
+                / num_samples
+                + self.rms_alignment_eps
+            )
+            enhanced = enhanced * (noisy_rms / enhanced_rms)
+            enhanced = (
+                self.enhanced_weight * enhanced + self.noisy_weight * noisy
+            ) * valid_mask
+
+        if self.output_waveform:
+            return enhanced, speech_lengths
 
         enhanced_stft, feats_lens = self._compute_stft(enhanced, speech_lengths)
         enhanced_power = enhanced_stft.real**2 + enhanced_stft.imag**2

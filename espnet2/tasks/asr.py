@@ -54,6 +54,7 @@ from espnet2.asr.encoder.whisper_encoder import OpenAIWhisperEncoder
 from espnet2.asr.espnet_model import ESPnetASRModel
 from espnet2.asr.frontend.abs_frontend import AbsFrontend
 from espnet2.asr.frontend.default import DefaultFrontend
+from espnet2.asr.frontend.frozen_enh import FrozenEnhFrontend
 from espnet2.asr.frontend.fused import FusedFrontends
 from espnet2.asr.frontend.jepa import JEPAFrontend
 from espnet2.asr.frontend.s3prl import S3prlFrontend
@@ -99,6 +100,7 @@ frontend_choices = ClassChoices(
         s3prl=S3prlFrontend,
         fused=FusedFrontends,
         jepa=JEPAFrontend,
+        frozen_enh=FrozenEnhFrontend,
         whisper=WhisperFrontend,
     ),  # If setting this to none, please make sure to provide input_size in the config.
     type_check=AbsFrontend,

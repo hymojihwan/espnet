@@ -1,0 +1,113 @@
+# RNNT + SE-JEPA frontend, matched to the noisy-100h pruned RNNT baseline.
+model: se_jepa
+
+batch_type: numel
+batch_bins: 6000000
+accum_grad: 24
+max_epoch: 200
+patience: 20
+init: none
+num_att_plot: 0
+log_interval: null
+unused_parameters: true
+
+model_conf:
+    transducer_weight: 1.0
+    auxiliary_ctc_weight: 0.0
+    report_cer: true
+    report_wer: true
+    use_k2_pruned_loss: true
+    use_model_jepa_modules: false
+    se_loss_weight: 0.1
+    jepa_loss_weight: 3.0
+    clean_feature_loss_weight: 0.0
+    clean_feature_cos_weight: 0.25
+    clean_train_scp: dump/raw/train_clean_100_noisy_randm5to15/clean_wav.scp
+    clean_valid_scp: dump/raw/dev_noisy_randm5to15/clean_wav.scp
+
+frontend: se_jepa
+frontend_conf:
+    se_train_config: exp/enh_train_enh_convtasnet_small_librispeech_raw/config.yaml
+    se_model_file: exp/enh_train_enh_convtasnet_small_librispeech_raw/valid.loss.best.pth
+    se_no_grad: true
+    use_asteroid_convtasnet: false
+    jepa_frontend_conf:
+        output_dim: 80
+        embedding_dim: 256
+        context_encoder_dim: 256
+        target_encoder_dim: 256
+        predictor_dim: 256
+        decoder_dim: 256
+        num_context_encoder_layers: 2
+        num_target_encoder_layers: 2
+        num_predictor_layers: 2
+        num_decoder_layers: 2
+        patch_size: [4, 4]
+        mask_ratio: 0.15
+        dropout_rate: 0.1
+        encoder_type: mlp
+        predictor_type: mlp
+        decoder_type: mlp
+        n_fft: 512
+        win_length: 400
+        hop_length: 160
+        fs: 16000
+        n_mels: 80
+        embedding_loss_weight: 0.08
+        ema_decay: 0.999
+
+encoder_conf:
+    main_conf:
+      pos_wise_act_type: swish
+      conv_mod_act_type: swish
+      pos_enc_dropout_rate: 0.1
+      dynamic_chunk_training: false
+      short_chunk_threshold: 0.75
+      short_chunk_size: 25
+      num_left_chunks: 4
+    input_conf:
+      vgg_like: true
+    body_conf:
+    - block_type: conformer
+      linear_size: 1024
+      hidden_size: 384
+      heads: 4
+      dropout_rate: 0.1
+      pos_wise_dropout_rate: 0.1
+      att_dropout_rate: 0.1
+      conv_mod_kernel_size: 31
+      num_blocks: 12
+
+decoder: rnn
+decoder_conf:
+    rnn_type: lstm
+    num_layers: 1
+    embed_size: 384
+    hidden_size: 384
+    dropout_rate: 0.1
+    embed_dropout_rate: 0.1
+
+joint_network_conf:
+    joint_space_size: 384
+
+optim: adam
+optim_conf:
+    lr: 0.0002
+    weight_decay: 0.000001
+scheduler: warmuplr
+scheduler_conf:
+    warmup_steps: 5000
+
+specaug: null
+use_amp: true
+cudnn_deterministic: false
+cudnn_benchmark: false
+
+val_scheduler_criterion:
+    - valid
+    - loss
+best_model_criterion:
+-   - valid
+    - loss
+    - min
+keep_nbest_models: 10

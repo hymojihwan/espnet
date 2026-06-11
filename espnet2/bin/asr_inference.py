@@ -18,6 +18,7 @@ from espnet2.asr.decoder.hugging_face_transformers_decoder import (
     get_hugging_face_model_network,
 )
 from espnet2.asr.decoder.s4_decoder import S4Decoder
+from espnet2.asr.decoder.whisper_decoder import OpenAIWhisperDecoder
 from espnet2.asr.partially_AR_model import PartiallyARInference
 from espnet2.asr.transducer.beam_search_transducer import BeamSearchTransducer
 from espnet2.asr.transducer.beam_search_transducer import (
@@ -647,8 +648,23 @@ class Speech2Text:
                     for module in self.beam_search.nn_dict.decoder.modules():
                         if hasattr(module, "setup_step"):
                             module.setup_step()
+            maxlenratio = self.maxlenratio
+            decoder = getattr(self.beam_search.nn_dict, "decoder", None)
+            if isinstance(decoder, OpenAIWhisperDecoder):
+                max_text_positions = decoder.decoders.positional_embedding.size(0)
+                primer = getattr(self.beam_search, "hyp_primer", None)
+                primer_len = len(primer) if primer is not None else 1
+                max_output_length = max(1, max_text_positions - primer_len + 1)
+                if maxlenratio == 0.0 and enc.shape[0] > max_output_length:
+                    maxlenratio = -max_output_length
+                elif maxlenratio > 0.0:
+                    requested_maxlen = max(1, int(maxlenratio * enc.size(0)))
+                    if requested_maxlen > max_output_length:
+                        maxlenratio = -max_output_length
+                elif maxlenratio < 0.0 and abs(int(maxlenratio)) > max_output_length:
+                    maxlenratio = -max_output_length
             nbest_hyps = self.beam_search(
-                x=enc, maxlenratio=self.maxlenratio, minlenratio=self.minlenratio
+                x=enc, maxlenratio=maxlenratio, minlenratio=self.minlenratio
             )
 
         nbest_hyps = nbest_hyps[: self.nbest]

@@ -171,10 +171,14 @@ class OpenAIWhisperEncoder(AbsEncoder):
         ilens: torch.Tensor,
         prev_states: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        if self.do_pad_trim:
-            xs_pad = self.pad_or_trim(xs_pad, self.pad_samples)
+        if xs_pad.dim() == 3 and xs_pad.size(-1) == self.n_mels:
+            feats = xs_pad.transpose(1, 2)
+            feats_lens = ilens
+        else:
+            if self.do_pad_trim:
+                xs_pad = self.pad_or_trim(xs_pad, self.pad_samples)
 
-        feats, feats_lens = self.log_mel_spectrogram(xs_pad, ilens)
+            feats, feats_lens = self.log_mel_spectrogram(xs_pad, ilens)
 
         if self.specaug is not None and self.encoders.training:
             feats = torch.transpose(feats, 1, 2)

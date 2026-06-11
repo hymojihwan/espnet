@@ -53,12 +53,13 @@ class ESPnetSEJEPAASRModel(ESPnetJEPAASRModel):
             and self.training
         ):
             # 1. Waveform-domain SI-SNR loss (always present to prevent SE "hacks")
-            loss_se = self.frontend.compute_se_loss()
-            if loss_se is not None:
-                loss = loss + self.se_loss_weight * loss_se
-                stats["loss_se"] = loss_se.detach()
-                stats["se_loss_weight"] = self.se_loss_weight
-            
+            if self.se_loss_weight > 0.0:
+                loss_se = self.frontend.compute_se_loss()
+                if loss_se is not None:
+                    loss = loss + self.se_loss_weight * loss_se
+                    stats["loss_se"] = loss_se.detach()
+                    stats["se_loss_weight"] = self.se_loss_weight
+
             # 2. ASR encoder feature distillation loss (clean encoder as target)
             # This prevents SE from learning tricks that minimize log-mel loss but degrade intelligibility
             if self.encoder_distill_weight > 0.0:

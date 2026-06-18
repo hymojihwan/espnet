@@ -223,8 +223,15 @@ class SE_JEPAFrontend(AbsFrontend):
         return feats, feats_lengths
 
     def compute_jepa_loss(self) -> Optional[torch.Tensor]:
-        """JEPA loss from the inner frontend."""
-        return self.jepa_frontend.compute_jepa_loss()
+        """Return the unweighted JEPA loss from the inner frontend."""
+        loss = self.jepa_frontend.compute_jepa_loss()
+        if loss is None:
+            return None
+
+        weight = self.embedding_loss_weight
+        if weight == 0.0:
+            return loss.detach() * 0.0
+        return loss / weight
 
     def compute_se_loss(self) -> Optional[torch.Tensor]:
         """SI-SNR loss: enhanced_wav vs clean_wav (ref=clean, est=enhanced)."""

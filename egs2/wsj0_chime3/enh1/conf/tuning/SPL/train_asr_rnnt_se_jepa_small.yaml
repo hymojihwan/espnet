@@ -19,7 +19,7 @@ model_conf:
     use_k2_pruned_loss: true
     use_model_jepa_modules: false
     se_loss_weight: 0.1
-    jepa_loss_weight: 0.1
+    jepa_loss_weight: 3.0
     clean_feature_loss_weight: 0.0
     clean_feature_cos_weight: 0.25
     clean_train_scp: dump/raw/train/clean_wav.scp

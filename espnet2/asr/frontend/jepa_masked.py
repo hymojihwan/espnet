@@ -120,6 +120,8 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
         normalized: bool = False,
         onesided: bool = True,
         whisper_compatible_mel: bool = False,
+        inference_full_reconstruction: bool = False,
+        asr_input_mode: str = "masked",
     ):
         # Convert patch_size to tuple if it's a list (from YAML config)
         # This must be done before type checking
@@ -152,6 +154,13 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
         self.decoder_type = decoder_type
         self.decoder_conf = decoder_conf or {}
         self.whisper_compatible_mel = whisper_compatible_mel
+        self.inference_full_reconstruction = inference_full_reconstruction
+        if asr_input_mode not in ("masked", "bridge"):
+            raise ValueError(
+                "asr_input_mode must be either 'masked' or 'bridge', "
+                f"got {asr_input_mode}"
+            )
+        self.asr_input_mode = asr_input_mode
 
         if self.whisper_compatible_mel:
             try:
@@ -583,6 +592,78 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
             mask[b, indices] = True
         return mask
 
+    def _encode_context_patches(
+        self,
+        noisy_patches: torch.Tensor,
+        patch_mask: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode noisy patches, optionally replacing masked patches first."""
+        B, num_patches, _ = noisy_patches.shape
+        if self.encoder_type == "transformer":
+            context_features = self.context_patch_embed(noisy_patches)
+            if mask.any():
+                mask_token_expanded = self.mask_token.expand(B, num_patches, -1)
+                context_features = torch.where(
+                    mask.unsqueeze(-1), mask_token_expanded, context_features
+                )
+
+            if self.context_pos_enc is not None:
+                context_features = self.context_pos_enc(context_features)
+
+            valid_mask = patch_mask.unsqueeze(1)
+            for encoder_layer in self.context_encoder["encoders"]:
+                context_features, valid_mask = encoder_layer(
+                    context_features, valid_mask
+                )
+            return self.context_encoder["after_norm"](context_features)
+
+        noisy_patches_masked = noisy_patches
+        if mask.any():
+            mask_token_expanded = self.mask_token.expand(B, num_patches, -1)
+            noisy_patches_masked = torch.where(
+                mask.unsqueeze(-1), mask_token_expanded, noisy_patches
+            )
+        return self.context_encoder(noisy_patches_masked)
+
+    def _predict_latents(
+        self,
+        context_features: torch.Tensor,
+        patch_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Predict target latents from context features."""
+        if self.predictor_type == "transformer":
+            pred_features = context_features
+            if self.predictor_pos_enc is not None:
+                pred_features = self.predictor_pos_enc(pred_features)
+
+            valid_mask = patch_mask.unsqueeze(1)
+            for encoder_layer in self.predictor["encoders"]:
+                pred_features, valid_mask = encoder_layer(pred_features, valid_mask)
+            return self.predictor["after_norm"](pred_features)
+
+        return self.predictor(context_features)
+
+    def _decode_full_bridge(
+        self,
+        context_features: torch.Tensor,
+        noisy_patches: torch.Tensor,
+        patch_mask: torch.Tensor,
+        original_shape: Tuple[int, int],
+        patch_grid: Tuple[int, int],
+    ) -> torch.Tensor:
+        """Decode every valid patch for the ASR input bridge path."""
+        predicted_latents = self._predict_latents(context_features, patch_mask)
+        reconstructed_patches = self.decoder(
+            predicted_latents.reshape(-1, self.embedding_dim)
+        ).view_as(noisy_patches)
+        full_reconstructed_patches = torch.where(
+            patch_mask.unsqueeze(-1),
+            reconstructed_patches.to(noisy_patches.dtype),
+            noisy_patches,
+        )
+        return self._unpatch(full_reconstructed_patches, original_shape, patch_grid)
+
     def train(self, mode: bool = True):
         """Set training mode.
         
@@ -669,49 +750,8 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
             # During inference, don't mask (or use a fixed pattern)
             mask = torch.zeros(B, num_patches, dtype=torch.bool, device=x_n.device)
 
-        # 4. Replace masked patches with mask token before encoding
-        if self.encoder_type == "transformer":
-            # For transformer: embed all patches first
-            noisy_patches_embedded = self.context_patch_embed(noisy_patches)  # (B, num_patches, embedding_dim)
-            # Replace masked patches with mask token in embedding space
-            if mask.any():
-                mask_token_expanded = self.mask_token.expand(B, num_patches, -1)  # (B, num_patches, embedding_dim)
-                mask_3d = mask.unsqueeze(-1)  # (B, num_patches, 1)
-                noisy_patches_embedded = torch.where(
-                    mask_3d, mask_token_expanded, noisy_patches_embedded
-                )
-        else:
-            # For MLP: replace masked patches with mask token in patch space
-            noisy_patches_masked = noisy_patches.clone()
-            if mask.any():
-                mask_token_expanded = self.mask_token.expand(B, num_patches, -1)  # (B, num_patches, patch_dim)
-                mask_3d = mask.unsqueeze(-1)  # (B, num_patches, 1)
-                noisy_patches_masked = torch.where(
-                    mask_3d, mask_token_expanded, noisy_patches_masked
-                )
-        
-        # 5. Process all patches through context encoder
-        if self.encoder_type == "transformer":
-            # Use embedded patches with mask tokens
-            context_features = noisy_patches_embedded  # (B, num_patches, embedding_dim)
-            
-            # Add positional encoding
-            if self.context_pos_enc is not None:
-                context_features = self.context_pos_enc(context_features)
-            
-            # Create mask for valid patches (for transformer attention)
-            # mask shape: (B, 1, num_patches) - True for valid patches
-            valid_mask = patch_mask.unsqueeze(1)  # (B, 1, num_patches)
-            
-            # Apply transformer encoder layers
-            for encoder_layer in self.context_encoder["encoders"]:
-                context_features, valid_mask = encoder_layer(context_features, valid_mask)
-            
-            # Apply final layer norm
-            context_features = self.context_encoder["after_norm"](context_features)
-        else:
-            # MLP encoder
-            context_features = self.context_encoder(noisy_patches_masked)  # (B, num_patches, embedding_dim)
+        # 4. Process patches through context encoder for the JEPA masked branch
+        context_features = self._encode_context_patches(noisy_patches, patch_mask, mask)
         
         if mask.any() and self.training and clean_input is not None:
             # Training mode: use target encoder for clean patches
@@ -742,26 +782,7 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
                     target_latents = self.target_encoder(clean_patches)  # (B, num_patches, embedding_dim)
             
             # Predict target latents for masked regions
-            if self.predictor_type == "transformer":
-                # Transformer predictor: process all context features
-                pred_features = context_features  # (B, num_patches, embedding_dim)
-                
-                # Add positional encoding
-                if self.predictor_pos_enc is not None:
-                    pred_features = self.predictor_pos_enc(pred_features)
-                
-                # Create mask for valid patches
-                valid_mask = patch_mask.unsqueeze(1)  # (B, 1, num_patches)
-                
-                # Apply transformer encoder layers
-                for encoder_layer in self.predictor["encoders"]:
-                    pred_features, valid_mask = encoder_layer(pred_features, valid_mask)
-                
-                # Apply final layer norm
-                predicted_latents = self.predictor["after_norm"](pred_features)  # (B, num_patches, embedding_dim)
-            else:
-                # MLP predictor
-                predicted_latents = self.predictor(context_features)  # (B, num_patches, embedding_dim)
+            predicted_latents = self._predict_latents(context_features, patch_mask)
             
             # Select masked patches
             masked_predicted_latents = predicted_latents[mask.unsqueeze(-1).expand_as(predicted_latents)].view(-1, self.embedding_dim)
@@ -789,31 +810,19 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
             self._last_reconstructed_patches = reconstructed_patches
         else:
             # Inference mode: predict and decode masked patches
-            if mask.any():
-                if self.predictor_type == "transformer":
-                    # Transformer predictor: process all context features
-                    pred_features = context_features  # (B, num_patches, embedding_dim)
-                    
-                    # Add positional encoding
-                    if self.predictor_pos_enc is not None:
-                        pred_features = self.predictor_pos_enc(pred_features)
-                    
-                    # Create mask for valid patches
-                    valid_mask = patch_mask.unsqueeze(1)  # (B, 1, num_patches)
-                    
-                    # Apply transformer encoder layers
-                    for encoder_layer in self.predictor["encoders"]:
-                        pred_features, valid_mask = encoder_layer(pred_features, valid_mask)
-                    
-                    # Apply final layer norm
-                    predicted_latents = self.predictor["after_norm"](pred_features)  # (B, num_patches, embedding_dim)
-                    
-                    # Select masked patches
-                    masked_predicted_latents = predicted_latents[mask.unsqueeze(-1).expand_as(predicted_latents)].view(-1, self.embedding_dim)
-                else:
-                    # MLP predictor: process only masked patches
-                    masked_context_features = context_features[mask.unsqueeze(-1).expand_as(context_features)].view(-1, self.embedding_dim)
-                    masked_predicted_latents = self.predictor(masked_context_features)
+            if self.inference_full_reconstruction:
+                x_hat = self._decode_full_bridge(
+                    context_features,
+                    noisy_patches,
+                    patch_mask,
+                    original_shape,
+                    patch_grid,
+                )
+            elif mask.any():
+                predicted_latents = self._predict_latents(context_features, patch_mask)
+                masked_predicted_latents = predicted_latents[
+                    mask.unsqueeze(-1).expand_as(predicted_latents)
+                ].view(-1, self.embedding_dim)
                 
                 reconstructed_patches = self.decoder(masked_predicted_latents)
                 
@@ -832,6 +841,21 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
             self._last_noisy_patches = None
             self._last_clean_patches = None
             self._last_reconstructed_patches = None
+
+        if self.asr_input_mode == "bridge":
+            unmasked_context_features = context_features
+            if mask.any():
+                no_mask = torch.zeros_like(mask)
+                unmasked_context_features = self._encode_context_patches(
+                    noisy_patches, patch_mask, no_mask
+                )
+            x_hat = self._decode_full_bridge(
+                unmasked_context_features,
+                noisy_patches,
+                patch_mask,
+                original_shape,
+                patch_grid,
+            )
 
         return x_hat, feats_lens
 

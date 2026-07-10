@@ -73,6 +73,12 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
         num_decoder_layers: Number of decoder layers (default: 2)
         patch_size: Size of patches in (time, freq) dimensions (default: (4, 4))
         mask_ratio: Ratio of patches to mask (default: 0.3)
+        random_mask_ratio: Randomly sample the training mask ratio between
+            mask_ratio_min and mask_ratio (default: False)
+        mask_ratio_min: Minimum mask ratio used when random_mask_ratio is true
+            (default: 0.0)
+        zero_mask_prob: Probability of forcing mask_ratio=0.0 during training
+            (default: 0.0)
         dropout_rate: Dropout rate (default: 0.1)
         n_fft: FFT size for STFT (default: 512)
         hop_length: Hop length for STFT (default: 128)
@@ -101,6 +107,9 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
         num_decoder_layers: int = 2,
         patch_size: Any = (4, 4),  # (time, freq) - can accept list/tuple from YAML
         mask_ratio: float = 0.3,
+        random_mask_ratio: bool = False,
+        mask_ratio_min: float = 0.0,
+        zero_mask_prob: float = 0.0,
         dropout_rate: float = 0.1,
         encoder_type: str = "mlp",  # "mlp" or "transformer"
         encoder_conf: Optional[Dict[str, Any]] = None,
@@ -122,6 +131,7 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
         whisper_compatible_mel: bool = False,
         inference_full_reconstruction: bool = False,
         asr_input_mode: str = "masked",
+        bridge_residual_weight: float = 0.1,
     ):
         # Convert patch_size to tuple if it's a list (from YAML config)
         # This must be done before type checking
@@ -142,6 +152,9 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
         self.num_decoder_layers = num_decoder_layers
         self.patch_size: Tuple[int, int] = patch_size  # Now guaranteed to be tuple
         self.mask_ratio = mask_ratio
+        self.random_mask_ratio = random_mask_ratio
+        self.mask_ratio_min = mask_ratio_min
+        self.zero_mask_prob = zero_mask_prob
         self.dropout_rate = dropout_rate
         self.hop_length = hop_length
         self.n_mels = n_mels
@@ -155,12 +168,25 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
         self.decoder_conf = decoder_conf or {}
         self.whisper_compatible_mel = whisper_compatible_mel
         self.inference_full_reconstruction = inference_full_reconstruction
-        if asr_input_mode not in ("masked", "bridge"):
+        if asr_input_mode not in ("masked", "bridge", "residual_bridge"):
             raise ValueError(
-                "asr_input_mode must be either 'masked' or 'bridge', "
+                "asr_input_mode must be 'masked', 'bridge', or "
+                "'residual_bridge', "
                 f"got {asr_input_mode}"
             )
         self.asr_input_mode = asr_input_mode
+        self.bridge_residual_weight = bridge_residual_weight
+
+        if not 0.0 <= self.mask_ratio_min <= self.mask_ratio <= 1.0:
+            raise ValueError(
+                "Expected 0.0 <= mask_ratio_min <= mask_ratio <= 1.0, "
+                f"got mask_ratio_min={mask_ratio_min}, mask_ratio={mask_ratio}"
+            )
+        if not 0.0 <= self.zero_mask_prob <= 1.0:
+            raise ValueError(
+                "Expected 0.0 <= zero_mask_prob <= 1.0, "
+                f"got {zero_mask_prob}"
+            )
 
         if self.whisper_compatible_mel:
             try:
@@ -573,6 +599,7 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
         num_patches: int,
         batch_size: int,
         device: torch.device,
+        mask_ratio: Optional[float] = None,
     ) -> torch.Tensor:
         """Create random mask for patches.
 
@@ -584,13 +611,40 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
         Returns:
             mask: (B, num_patches) - Boolean mask (True for masked patches)
         """
-        num_masked = int(num_patches * self.mask_ratio)
+        if mask_ratio is None:
+            mask_ratio = self.mask_ratio
+        num_masked = int(num_patches * mask_ratio)
         mask = torch.zeros(batch_size, num_patches, dtype=torch.bool, device=device)
+        if num_masked <= 0:
+            return mask
         for b in range(batch_size):
             # Randomly select patches to mask
             indices = torch.randperm(num_patches, device=device)[:num_masked]
             mask[b, indices] = True
         return mask
+
+    def _sample_training_mask_ratio(self, device: torch.device) -> float:
+        """Sample the mask ratio used for the current training batch."""
+        sample = torch.rand((), device=device)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast(sample, src=0)
+
+        sample_value = sample.item()
+        if self.zero_mask_prob > 0.0:
+            if sample_value < self.zero_mask_prob:
+                return 0.0
+
+            sample_value = (
+                (sample_value - self.zero_mask_prob)
+                / max(1.0 - self.zero_mask_prob, 1.0e-8)
+            )
+
+        if self.random_mask_ratio:
+            return self.mask_ratio_min + sample_value * (
+                self.mask_ratio - self.mask_ratio_min
+            )
+
+        return self.mask_ratio
 
     def _encode_context_patches(
         self,
@@ -607,6 +661,8 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
                 context_features = torch.where(
                     mask.unsqueeze(-1), mask_token_expanded, context_features
                 )
+            elif self.training:
+                context_features = context_features + self.mask_token.sum() * 0.0
 
             if self.context_pos_enc is not None:
                 context_features = self.context_pos_enc(context_features)
@@ -663,6 +719,30 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
             noisy_patches,
         )
         return self._unpatch(full_reconstructed_patches, original_shape, patch_grid)
+
+    def _decode_unmasked_bridge(
+        self,
+        context_features: torch.Tensor,
+        noisy_patches: torch.Tensor,
+        patch_mask: torch.Tensor,
+        mask: torch.Tensor,
+        original_shape: Tuple[int, int],
+        patch_grid: Tuple[int, int],
+    ) -> torch.Tensor:
+        """Decode all patches from an unmasked context path."""
+        unmasked_context_features = context_features
+        if mask.any():
+            no_mask = torch.zeros_like(mask)
+            unmasked_context_features = self._encode_context_patches(
+                noisy_patches, patch_mask, no_mask
+            )
+        return self._decode_full_bridge(
+            unmasked_context_features,
+            noisy_patches,
+            patch_mask,
+            original_shape,
+            patch_grid,
+        )
 
     def train(self, mode: bool = True):
         """Set training mode.
@@ -743,7 +823,10 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
 
         # 3. Create mask for patches (random masking during training)
         if self.training:
-            mask = self._random_mask_patches(num_patches, B, x_n.device)
+            current_mask_ratio = self._sample_training_mask_ratio(x_n.device)
+            mask = self._random_mask_patches(
+                num_patches, B, x_n.device, current_mask_ratio
+            )
             # Combine with patch_mask (only mask valid patches)
             mask = mask & patch_mask
         else:
@@ -842,20 +925,19 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
             self._last_clean_patches = None
             self._last_reconstructed_patches = None
 
-        if self.asr_input_mode == "bridge":
-            unmasked_context_features = context_features
-            if mask.any():
-                no_mask = torch.zeros_like(mask)
-                unmasked_context_features = self._encode_context_patches(
-                    noisy_patches, patch_mask, no_mask
-                )
-            x_hat = self._decode_full_bridge(
-                unmasked_context_features,
+        if self.asr_input_mode in ("bridge", "residual_bridge"):
+            bridge_x = self._decode_unmasked_bridge(
+                context_features,
                 noisy_patches,
                 patch_mask,
+                mask,
                 original_shape,
                 patch_grid,
             )
+            if self.asr_input_mode == "bridge":
+                x_hat = bridge_x
+            else:
+                x_hat = x_n + self.bridge_residual_weight * (bridge_x - x_n)
 
         return x_hat, feats_lens
 

@@ -54,12 +54,16 @@ from espnet2.enh.separator.conformer_separator import ConformerSeparator
 from espnet2.enh.separator.dan_separator import DANSeparator
 from espnet2.enh.separator.dc_crn_separator import DC_CRNSeparator
 from espnet2.enh.separator.dccrn_separator import DCCRNSeparator
+from espnet2.enh.separator.demucs_separator import DemucsSeparator
 from espnet2.enh.separator.dpcl_e2e_separator import DPCLE2ESeparator
 from espnet2.enh.separator.dpcl_separator import DPCLSeparator
 from espnet2.enh.separator.dprnn_separator import DPRNNSeparator
 from espnet2.enh.separator.dptnet_separator import DPTNetSeparator
 from espnet2.enh.separator.fasnet_separator import FaSNetSeparator
+from espnet2.enh.separator.frcrn_separator import FRCRNSeparator
 from espnet2.enh.separator.ineube_separator import iNeuBe
+from espnet2.enh.separator.mossformer2_separator import MossFormer2Separator
+from espnet2.enh.separator.mp_senet_separator import MPSENetSeparator
 from espnet2.enh.separator.neural_beamformer import NeuralBeamformer
 from espnet2.enh.separator.rnn_separator import RNNSeparator
 from espnet2.enh.separator.skim_separator import SkiMSeparator
@@ -102,12 +106,16 @@ separator_choices = ClassChoices(
         dan=DANSeparator,
         dc_crn=DC_CRNSeparator,
         dccrn=DCCRNSeparator,
+        demucs=DemucsSeparator,
         dpcl=DPCLSeparator,
         dpcl_e2e=DPCLE2ESeparator,
         dprnn=DPRNNSeparator,
         dptnet=DPTNetSeparator,
         fasnet=FaSNetSeparator,
+        frcrn=FRCRNSeparator,
+        mp_senet=MPSENetSeparator,
         rnn=RNNSeparator,
+        mossformer2=MossFormer2Separator,
         skim=SkiMSeparator,
         svoice=SVoiceSeparator,
         tcn=TCNSeparator,

@@ -1,0 +1,115 @@
+# TF-GridNet frozen SE + Transformer(S) JEPA + AED, warm-started from TF-GridNet SE AED.
+batch_type: numel
+batch_bins: 2400000
+accum_grad: 64
+max_epoch: 40
+patience: 10
+init: none
+init_param:
+- exp/asr_asr_aed_conformer_tfgridnet_se_100h_noisy_main/valid.acc.best.pth:encoder:encoder
+- exp/asr_asr_aed_conformer_tfgridnet_se_100h_noisy_main/valid.acc.best.pth:decoder:decoder
+- exp/asr_asr_aed_conformer_tfgridnet_se_100h_noisy_main/valid.acc.best.pth:ctc:ctc
+num_att_plot: 0
+log_interval: null
+unused_parameters: false
+
+model: se_jepa_espnet
+model_conf:
+    ctc_weight: 0.3
+    lsm_weight: 0.1
+    length_normalized_loss: false
+    se_loss_weight: 0.0
+    encoder_distill_weight: 0.0
+
+frontend: se_jepa
+frontend_conf:
+    se_train_config: exp/enh_train_enh_tfgridnet_sizematch_librispeech_raw/config.yaml
+    se_model_file: exp/enh_train_enh_tfgridnet_sizematch_librispeech_raw/valid.loss.best.pth
+    se_no_grad: true
+    use_asteroid_convtasnet: false
+    jepa_frontend_conf:
+        output_dim: 80
+        embedding_dim: 112
+        context_encoder_dim: 112
+        target_encoder_dim: 112
+        predictor_dim: 112
+        decoder_dim: 112
+        num_context_encoder_layers: 2
+        num_target_encoder_layers: 2
+        num_predictor_layers: 2
+        num_decoder_layers: 2
+        patch_size: [10, 80]
+        mask_ratio: 0.15
+        dropout_rate: 0.1
+        encoder_type: transformer
+        encoder_conf:
+            num_layers: 1
+            num_heads: 4
+            ff_dim: 224
+            dropout_rate: 0.1
+            attn_dropout_rate: 0.1
+            use_positional_encoding: true
+        predictor_type: transformer
+        predictor_conf:
+            num_layers: 1
+            num_heads: 4
+            ff_dim: 224
+            dropout_rate: 0.1
+            attn_dropout_rate: 0.1
+            use_positional_encoding: true
+        decoder_type: mlp
+        n_fft: 512
+        win_length: 400
+        hop_length: 160
+        fs: 16000
+        n_mels: 80
+        embedding_loss_weight: 0.08
+        ema_decay: 0.999
+
+encoder: conformer
+encoder_conf:
+    output_size: 256
+    attention_heads: 4
+    linear_units: 1024
+    num_blocks: 12
+    dropout_rate: 0.1
+    positional_dropout_rate: 0.1
+    attention_dropout_rate: 0.1
+    input_layer: conv2d
+    normalize_before: true
+    macaron_style: true
+    rel_pos_type: latest
+    pos_enc_layer_type: rel_pos
+    selfattention_layer_type: rel_selfattn
+    activation_type: swish
+    use_cnn_module: true
+    cnn_module_kernel: 31
+
+decoder: transformer
+decoder_conf:
+    attention_heads: 4
+    linear_units: 2048
+    num_blocks: 6
+    dropout_rate: 0.1
+    positional_dropout_rate: 0.1
+    self_attention_dropout_rate: 0.1
+    src_attention_dropout_rate: 0.1
+
+optim: adam
+optim_conf:
+    lr: 0.00005
+    weight_decay: 0.000001
+scheduler: warmuplr
+scheduler_conf:
+    warmup_steps: 1000
+
+specaug: null
+use_amp: true
+cudnn_deterministic: false
+cudnn_benchmark: false
+
+best_model_criterion:
+-   - valid
+    - acc
+    - max
+keep_nbest_models: 10

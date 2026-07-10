@@ -1,0 +1,106 @@
+# Whisper-tiny BPE-2048 ASR with frozen SE, OA82, and Transformer(S) JEPA matched to small MLP JEPA size.
+normalize: null
+
+model: se_jepa_espnet
+model_conf:
+    ctc_weight: 0.0
+    lsm_weight: 0.1
+    length_normalized_loss: false
+    se_loss_weight: 0.0
+    encoder_distill_weight: 0.0
+
+frontend: se_jepa
+frontend_conf:
+    se_train_config: exp/enh_train_enh_convtasnet_small_librispeech_raw/config.yaml
+    se_model_file: exp/enh_train_enh_convtasnet_small_librispeech_raw/valid.loss.best.pth
+    se_no_grad: true
+    observation_addition: true
+    enhanced_weight: 0.8
+    noisy_weight: 0.2
+    use_asteroid_convtasnet: false
+    jepa_frontend_conf:
+        output_dim: 80
+        embedding_dim: 112
+        context_encoder_dim: 112
+        target_encoder_dim: 112
+        predictor_dim: 112
+        decoder_dim: 112
+        num_context_encoder_layers: 2
+        num_target_encoder_layers: 2
+        num_predictor_layers: 2
+        num_decoder_layers: 2
+        patch_size: [10, 80]
+        mask_ratio: 0.15
+        dropout_rate: 0.1
+        encoder_type: transformer
+        encoder_conf:
+            num_layers: 1
+            num_heads: 4
+            ff_dim: 224
+            dropout_rate: 0.1
+            attn_dropout_rate: 0.1
+            use_positional_encoding: true
+        predictor_type: transformer
+        predictor_conf:
+            num_layers: 1
+            num_heads: 4
+            ff_dim: 224
+            dropout_rate: 0.1
+            attn_dropout_rate: 0.1
+            use_positional_encoding: true
+        decoder_type: mlp
+        n_fft: 400
+        win_length: 400
+        hop_length: 160
+        fs: 16000
+        n_mels: 80
+        whisper_compatible_mel: true
+        embedding_loss_weight: 0.08
+        ema_decay: 0.999
+
+encoder: whisper
+encoder_conf:
+    whisper_model: tiny
+    dropout_rate: 0.0
+    use_specaug: false
+
+decoder: whisper
+decoder_conf:
+    whisper_model: tiny
+    dropout_rate: 0.0
+
+seed: 2022
+log_interval: null
+num_att_plot: 0
+num_workers: 4
+sort_in_batch: descending
+sort_batch: descending
+batch_type: numel
+batch_bins: 19200000
+accum_grad: 8
+max_epoch: 200
+patience: none
+init: none
+best_model_criterion:
+-   - valid
+    - acc
+    - max
+keep_nbest_models: 10
+
+use_amp: true
+cudnn_deterministic: false
+cudnn_benchmark: false
+unused_parameters: true
+
+optim: adamw
+grad_clip: 1.0
+optim_conf:
+    lr: 1.0e-05
+    weight_decay: 0.01
+    betas:
+    - 0.9
+    - 0.99
+    eps: 1.0e-06
+scheduler: warmuplr
+scheduler_conf:
+    warmup_steps: 1500

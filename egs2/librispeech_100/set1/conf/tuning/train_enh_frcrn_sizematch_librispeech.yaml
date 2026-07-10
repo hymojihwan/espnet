@@ -1,0 +1,73 @@
+optim: adam
+init: xavier_uniform
+max_epoch: 30
+batch_type: folded
+batch_size: 64
+iterator_type: chunk
+chunk_length: 32000
+chunk_excluded_key_prefixes:
+  - token_int
+chunk_discard_short_samples: false
+num_workers: 8
+optim_conf:
+    lr: 1.0e-03
+    eps: 1.0e-08
+    weight_decay: 1.0e-05
+patience: 4
+val_scheduler_criterion:
+- valid
+- loss
+best_model_criterion:
+-   - valid
+    - si_snr
+    - max
+-   - valid
+    - loss
+    - min
+keep_nbest_models: 1
+scheduler: reducelronplateau
+scheduler_conf:
+    mode: min
+    factor: 0.5
+    patience: 3
+model_conf:
+    loss_type: si_snr
+encoder: stft
+encoder_conf:
+    n_fft: 512
+    win_length: 400
+    hop_length: 160
+    window: hann
+    center: true
+    normalized: false
+    onesided: true
+decoder: stft
+decoder_conf:
+    n_fft: 512
+    win_length: 400
+    hop_length: 160
+    window: hann
+    center: true
+    normalized: false
+    onesided: true
+separator: frcrn
+separator_conf:
+    num_spk: 1
+    rnn_layer: 2
+    rnn_units: 192
+    freq_rnn_units: 96
+    freq_rnn_layers: 1
+    masking_mode: E
+    bidirectional: false
+    use_cbn: false
+    kernel_size: 5
+    kernel_num: [32, 64, 128, 192, 192]
+    use_builtin_complex: true
+    dropout: 0.0
+criterions:
+  - name: si_snr
+    conf:
+      eps: 1.0e-07
+    wrapper: fixed_order
+    wrapper_conf:
+      weight: 1.0

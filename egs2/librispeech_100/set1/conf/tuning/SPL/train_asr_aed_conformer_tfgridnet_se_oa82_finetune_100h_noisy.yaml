@@ -1,0 +1,84 @@
+# TF-GridNet frozen SE + OA82 + AED, warm-started from TF-GridNet SE AED.
+frontend: frozen_enh
+frontend_conf:
+    enh_train_config: exp/enh_train_enh_tfgridnet_sizematch_librispeech_raw/config.yaml
+    enh_model_file: exp/enh_train_enh_tfgridnet_sizematch_librispeech_raw/valid.loss.best.pth
+    fs: 16k
+    n_fft: 512
+    win_length: 400
+    hop_length: 160
+    n_mels: 80
+    enh_no_grad: true
+    observation_addition: true
+    enhanced_weight: 0.8
+    noisy_weight: 0.2
+
+encoder: conformer
+encoder_conf:
+    output_size: 256
+    attention_heads: 4
+    linear_units: 1024
+    num_blocks: 12
+    dropout_rate: 0.1
+    positional_dropout_rate: 0.1
+    attention_dropout_rate: 0.1
+    input_layer: conv2d
+    normalize_before: true
+    macaron_style: true
+    rel_pos_type: latest
+    pos_enc_layer_type: rel_pos
+    selfattention_layer_type: rel_selfattn
+    activation_type: swish
+    use_cnn_module: true
+    cnn_module_kernel: 31
+
+decoder: transformer
+decoder_conf:
+    attention_heads: 4
+    linear_units: 2048
+    num_blocks: 6
+    dropout_rate: 0.1
+    positional_dropout_rate: 0.1
+    self_attention_dropout_rate: 0.1
+    src_attention_dropout_rate: 0.1
+
+model_conf:
+    ctc_weight: 0.3
+    lsm_weight: 0.1
+    length_normalized_loss: false
+
+seed: 2022
+log_interval: null
+num_att_plot: 0
+num_workers: 4
+sort_in_batch: descending
+sort_batch: descending
+batch_type: numel
+batch_bins: 2400000
+accum_grad: 64
+max_epoch: 40
+patience: 10
+init: none
+init_param:
+- exp/asr_asr_aed_conformer_tfgridnet_se_100h_noisy_main/valid.acc.best.pth:encoder:encoder
+- exp/asr_asr_aed_conformer_tfgridnet_se_100h_noisy_main/valid.acc.best.pth:decoder:decoder
+- exp/asr_asr_aed_conformer_tfgridnet_se_100h_noisy_main/valid.acc.best.pth:ctc:ctc
+best_model_criterion:
+-   - valid
+    - acc
+    - max
+keep_nbest_models: 10
+
+use_amp: true
+cudnn_deterministic: false
+cudnn_benchmark: false
+
+optim: adam
+optim_conf:
+    lr: 0.00005
+    weight_decay: 0.000001
+scheduler: warmuplr
+scheduler_conf:
+    warmup_steps: 1000
+
+specaug: null

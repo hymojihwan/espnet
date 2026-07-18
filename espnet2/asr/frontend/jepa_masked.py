@@ -132,6 +132,7 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
         inference_full_reconstruction: bool = False,
         asr_input_mode: str = "masked",
         bridge_residual_weight: float = 0.1,
+        full_bridge_loss_weight: float = 0.0,
     ):
         # Convert patch_size to tuple if it's a list (from YAML config)
         # This must be done before type checking
@@ -168,14 +169,28 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
         self.decoder_conf = decoder_conf or {}
         self.whisper_compatible_mel = whisper_compatible_mel
         self.inference_full_reconstruction = inference_full_reconstruction
-        if asr_input_mode not in ("masked", "bridge", "residual_bridge"):
+        if asr_input_mode not in (
+            "masked",
+            "bridge",
+            "residual_bridge",
+            "teacher_bridge",
+            "context_projection",
+        ):
             raise ValueError(
-                "asr_input_mode must be 'masked', 'bridge', or "
-                "'residual_bridge', "
+                "asr_input_mode must be 'masked', 'bridge', "
+                "'residual_bridge', 'teacher_bridge', or "
+                "'context_projection', "
                 f"got {asr_input_mode}"
             )
         self.asr_input_mode = asr_input_mode
         self.bridge_residual_weight = bridge_residual_weight
+        self.full_bridge_loss_weight = full_bridge_loss_weight
+
+        if self.full_bridge_loss_weight < 0.0:
+            raise ValueError(
+                "Expected full_bridge_loss_weight >= 0.0, "
+                f"got {full_bridge_loss_weight}"
+            )
 
         if not 0.0 <= self.mask_ratio_min <= self.mask_ratio <= 1.0:
             raise ValueError(
@@ -352,29 +367,41 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
         else:
             raise ValueError(f"Unsupported predictor_type: {predictor_type}")
 
-        # Decoder: Reconstructs mel patches from latents
-        # Input: latents (B, num_masked_patches, embedding_dim)
-        # Output: reconstructed patches (B, num_masked_patches, patch_dim)
-        if decoder_type == "mlp":
-            # Use config if provided, otherwise use default parameters
-            dec_num_layers = self.decoder_conf.get("num_layers", num_decoder_layers)
-            dec_hidden_dim = self.decoder_conf.get("hidden_dim", decoder_dim)
-            dec_dropout = self.decoder_conf.get("dropout_rate", dropout_rate)
-            
-            decoder_layers = []
-            input_dim = embedding_dim
-            for i in range(dec_num_layers):
-                decoder_layers.extend([
-                    nn.Linear(input_dim, dec_hidden_dim),
-                    nn.LayerNorm(dec_hidden_dim),
-                    nn.ReLU(),
-                    nn.Dropout(dec_dropout),
-                ])
-                input_dim = dec_hidden_dim
-            decoder_layers.append(nn.Linear(input_dim, patch_dim))
-            self.decoder = nn.Sequential(*decoder_layers)
-        else:
-            raise ValueError(f"Unsupported decoder_type: {decoder_type}")
+        # The context-projection mode performs latent JEPA prediction and does
+        # not reconstruct masked mel patches.
+        self.decoder = None
+        if self.asr_input_mode != "context_projection":
+            if decoder_type == "mlp":
+                dec_num_layers = self.decoder_conf.get(
+                    "num_layers", num_decoder_layers
+                )
+                dec_hidden_dim = self.decoder_conf.get(
+                    "hidden_dim", decoder_dim
+                )
+                dec_dropout = self.decoder_conf.get(
+                    "dropout_rate", dropout_rate
+                )
+
+                decoder_layers = []
+                input_dim = embedding_dim
+                for i in range(dec_num_layers):
+                    decoder_layers.extend(
+                        [
+                            nn.Linear(input_dim, dec_hidden_dim),
+                            nn.LayerNorm(dec_hidden_dim),
+                            nn.ReLU(),
+                            nn.Dropout(dec_dropout),
+                        ]
+                    )
+                    input_dim = dec_hidden_dim
+                decoder_layers.append(nn.Linear(input_dim, patch_dim))
+                self.decoder = nn.Sequential(*decoder_layers)
+            else:
+                raise ValueError(f"Unsupported decoder_type: {decoder_type}")
+
+        self.asr_projector = None
+        if self.asr_input_mode == "context_projection":
+            self.asr_projector = nn.Linear(embedding_dim, patch_dim)
 
         # Mask token for replacing masked patches (learnable)
         # For transformer: mask token is in embedding space
@@ -412,6 +439,10 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
         self._last_noisy_patches = None
         self._last_clean_patches = None
         self._last_reconstructed_patches = None
+        self._last_full_reconstructed_patches = None
+        self._last_patch_mask = None
+        self._last_predicted_latents = None
+        self._last_target_latents = None
 
     def _build_transformer_encoder(
         self,
@@ -700,6 +731,46 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
 
         return self.predictor(context_features)
 
+    def _encode_target_patches(
+        self,
+        patches: torch.Tensor,
+        patch_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode patches with the EMA target encoder."""
+        with torch.no_grad():
+            if self.encoder_type == "transformer":
+                target_latents = self.target_patch_embed(patches)
+                if self.target_pos_enc is not None:
+                    target_latents = self.target_pos_enc(target_latents)
+
+                valid_mask = patch_mask.unsqueeze(1)
+                for encoder_layer in self.target_encoder["encoders"]:
+                    target_latents, valid_mask = encoder_layer(
+                        target_latents, valid_mask
+                    )
+                return self.target_encoder["after_norm"](target_latents)
+
+            return self.target_encoder(patches)
+
+    def _decode_teacher_bridge(
+        self,
+        noisy_patches: torch.Tensor,
+        patch_mask: torch.Tensor,
+        original_shape: Tuple[int, int],
+        patch_grid: Tuple[int, int],
+    ) -> torch.Tensor:
+        """Decode enhanced patches through EMA target encoder for ASR input."""
+        target_latents = self._encode_target_patches(noisy_patches, patch_mask)
+        reconstructed_patches = self.decoder(
+            target_latents.reshape(-1, self.embedding_dim)
+        ).view_as(noisy_patches)
+        full_reconstructed_patches = torch.where(
+            patch_mask.unsqueeze(-1),
+            reconstructed_patches.to(noisy_patches.dtype),
+            noisy_patches,
+        )
+        return self._unpatch(full_reconstructed_patches, original_shape, patch_grid)
+
     def _decode_full_bridge(
         self,
         context_features: torch.Tensor,
@@ -728,7 +799,7 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
         mask: torch.Tensor,
         original_shape: Tuple[int, int],
         patch_grid: Tuple[int, int],
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Decode all patches from an unmasked context path."""
         unmasked_context_features = context_features
         if mask.any():
@@ -736,13 +807,48 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
             unmasked_context_features = self._encode_context_patches(
                 noisy_patches, patch_mask, no_mask
             )
-        return self._decode_full_bridge(
-            unmasked_context_features,
-            noisy_patches,
-            patch_mask,
-            original_shape,
-            patch_grid,
+        predicted_latents = self._predict_latents(
+            unmasked_context_features, patch_mask
         )
+        reconstructed_patches = self.decoder(
+            predicted_latents.reshape(-1, self.embedding_dim)
+        ).view_as(noisy_patches)
+        full_reconstructed_patches = torch.where(
+            patch_mask.unsqueeze(-1),
+            reconstructed_patches.to(noisy_patches.dtype),
+            noisy_patches,
+        )
+        bridge_x = self._unpatch(
+            full_reconstructed_patches, original_shape, patch_grid
+        )
+        return bridge_x, reconstructed_patches
+
+    def _project_unmasked_context(
+        self,
+        context_features: torch.Tensor,
+        noisy_patches: torch.Tensor,
+        patch_mask: torch.Tensor,
+        mask: torch.Tensor,
+        original_shape: Tuple[int, int],
+        patch_grid: Tuple[int, int],
+    ) -> torch.Tensor:
+        """Project unmasked context latents to the ASR feature sequence."""
+        if self.asr_projector is None:
+            raise RuntimeError("ASR projector is not initialized")
+
+        unmasked_context_features = context_features
+        if mask.any():
+            no_mask = torch.zeros_like(mask)
+            unmasked_context_features = self._encode_context_patches(
+                noisy_patches, patch_mask, no_mask
+            )
+        projected_patches = self.asr_projector(unmasked_context_features)
+        projected_patches = torch.where(
+            patch_mask.unsqueeze(-1),
+            projected_patches.to(noisy_patches.dtype),
+            noisy_patches,
+        )
+        return self._unpatch(projected_patches, original_shape, patch_grid)
 
     def train(self, mode: bool = True):
         """Set training mode.
@@ -845,42 +951,32 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
             # Encode clean patches with target encoder (EMA)
             with torch.no_grad():
                 if self.encoder_type == "transformer":
-                    # Embed patches
-                    target_latents = self.target_patch_embed(clean_patches)  # (B, num_patches, embedding_dim)
-                    
-                    # Add positional encoding
-                    if self.target_pos_enc is not None:
-                        target_latents = self.target_pos_enc(target_latents)
-                    
-                    # Create mask for valid patches
-                    valid_mask = patch_mask.unsqueeze(1)  # (B, 1, num_patches)
-                    
-                    # Apply transformer encoder layers
-                    for encoder_layer in self.target_encoder["encoders"]:
-                        target_latents, valid_mask = encoder_layer(target_latents, valid_mask)
-                    
-                    # Apply final layer norm
-                    target_latents = self.target_encoder["after_norm"](target_latents)
+                    target_latents = self._encode_target_patches(
+                        clean_patches, patch_mask
+                    )
                 else:
-                    target_latents = self.target_encoder(clean_patches)  # (B, num_patches, embedding_dim)
+                    target_latents = self._encode_target_patches(
+                        clean_patches, patch_mask
+                    )
             
             # Predict target latents for masked regions
             predicted_latents = self._predict_latents(context_features, patch_mask)
             
-            # Select masked patches
-            masked_predicted_latents = predicted_latents[mask.unsqueeze(-1).expand_as(predicted_latents)].view(-1, self.embedding_dim)
-            
-            # Decode masked patches
-            reconstructed_patches = self.decoder(masked_predicted_latents)  # (num_masked, patch_dim)
-            
-            # Merge: unmasked from x_n, masked from reconstruction
-            # Reconstruct full patch structure with masked patches replaced
-            full_reconstructed_patches = noisy_patches.clone()
-            # Replace masked patches with reconstructed ones (match dtype for AMP)
-            full_reconstructed_patches[mask] = reconstructed_patches.to(full_reconstructed_patches.dtype)
-            
-            # Reconstruct spectrogram from patches
-            x_hat = self._unpatch(full_reconstructed_patches, original_shape, patch_grid)
+            if self.asr_input_mode == "context_projection":
+                reconstructed_patches = None
+                x_hat = x_n
+            else:
+                masked_predicted_latents = predicted_latents[
+                    mask.unsqueeze(-1).expand_as(predicted_latents)
+                ].view(-1, self.embedding_dim)
+                reconstructed_patches = self.decoder(masked_predicted_latents)
+                full_reconstructed_patches = noisy_patches.clone()
+                full_reconstructed_patches[mask] = reconstructed_patches.to(
+                    full_reconstructed_patches.dtype
+                )
+                x_hat = self._unpatch(
+                    full_reconstructed_patches, original_shape, patch_grid
+                )
             
             # Store for loss computation
             self._last_x_n = x_n
@@ -891,6 +987,9 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
             self._last_noisy_patches = noisy_patches
             self._last_clean_patches = clean_patches
             self._last_reconstructed_patches = reconstructed_patches
+            self._last_patch_mask = patch_mask
+            self._last_predicted_latents = predicted_latents
+            self._last_target_latents = target_latents
         else:
             # Inference mode: predict and decode masked patches
             if self.inference_full_reconstruction:
@@ -924,9 +1023,20 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
             self._last_noisy_patches = None
             self._last_clean_patches = None
             self._last_reconstructed_patches = None
+            self._last_full_reconstructed_patches = None
+            self._last_patch_mask = None
+            self._last_predicted_latents = None
+            self._last_target_latents = None
 
-        if self.asr_input_mode in ("bridge", "residual_bridge"):
-            bridge_x = self._decode_unmasked_bridge(
+        if self.asr_input_mode == "teacher_bridge" and not self.training:
+            x_hat = self._decode_teacher_bridge(
+                noisy_patches,
+                patch_mask,
+                original_shape,
+                patch_grid,
+            )
+        elif self.asr_input_mode == "context_projection":
+            x_hat = self._project_unmasked_context(
                 context_features,
                 noisy_patches,
                 patch_mask,
@@ -934,6 +1044,19 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
                 original_shape,
                 patch_grid,
             )
+        elif self.asr_input_mode in ("bridge", "residual_bridge"):
+            bridge_x, full_reconstructed_patches = self._decode_unmasked_bridge(
+                context_features,
+                noisy_patches,
+                patch_mask,
+                mask,
+                original_shape,
+                patch_grid,
+            )
+            if self.training and self._last_clean_patches is not None:
+                self._last_full_reconstructed_patches = (
+                    full_reconstructed_patches
+                )
             if self.asr_input_mode == "bridge":
                 x_hat = bridge_x
             else:
@@ -947,42 +1070,82 @@ class JEPA_MaskedPatchFrontend(AbsFrontend):
         Returns:
             loss: Scalar reconstruction loss, or None if not in training mode
         """
-        if self._last_reconstructed_patches is None or self._last_clean_patches is None or self._last_mask is None:
-            return None
-        
-        if not self._last_mask.any():
+        if self.asr_input_mode == "context_projection":
+            predicted_latents = self._last_predicted_latents
+            target_latents = self._last_target_latents
+            mask = self._last_mask
+            if (
+                predicted_latents is None
+                or target_latents is None
+                or mask is None
+            ):
+                return None
+            n_patches = min(
+                predicted_latents.size(1),
+                target_latents.size(1),
+                mask.size(1),
+            )
+            mask = mask[:, :n_patches]
+            if not mask.any():
+                return None
+            predicted_masked = predicted_latents[:, :n_patches, :][mask]
+            target_masked = target_latents[:, :n_patches, :][mask]
+            return self.embedding_loss_weight * F.mse_loss(
+                predicted_masked,
+                target_masked.detach(),
+                reduction="mean",
+            )
+
+        clean_patches = self._last_clean_patches
+        if clean_patches is None:
             return None
 
-        # Align sequence length defensively when paired noisy/clean streams are
-        # not perfectly matched (e.g., speed-perturbed noisy vs. non-perturbed clean).
+        loss = None
         mask = self._last_mask
         clean_patches = self._last_clean_patches
         reconstructed = self._last_reconstructed_patches
-        if mask.dim() != 2 or clean_patches.dim() != 3 or reconstructed.dim() != 2:
-            return None
+        if (
+            mask is not None
+            and reconstructed is not None
+            and mask.dim() == 2
+            and clean_patches.dim() == 3
+            and reconstructed.dim() == 2
+        ):
+            n_patches = min(mask.size(1), clean_patches.size(1))
+            mask = mask[:, :n_patches]
+            masked_clean_patches = clean_patches[:, :n_patches, :][mask]
+            n_masked = min(
+                reconstructed.size(0), masked_clean_patches.size(0)
+            )
+            if n_masked > 0:
+                loss = self.embedding_loss_weight * F.mse_loss(
+                    reconstructed[:n_masked],
+                    masked_clean_patches[:n_masked],
+                    reduction="mean",
+                )
 
-        n_patches = min(mask.size(1), clean_patches.size(1))
-        if n_patches <= 0:
-            return None
-        mask = mask[:, :n_patches]
-        clean_patches = clean_patches[:, :n_patches, :]
-        if not mask.any():
-            return None
+        full_reconstructed = self._last_full_reconstructed_patches
+        patch_mask = self._last_patch_mask
+        if (
+            self.full_bridge_loss_weight > 0.0
+            and full_reconstructed is not None
+            and patch_mask is not None
+        ):
+            n_patches = min(
+                patch_mask.size(1),
+                clean_patches.size(1),
+                full_reconstructed.size(1),
+            )
+            valid_mask = patch_mask[:, :n_patches]
+            if valid_mask.any():
+                full_loss = self.full_bridge_loss_weight * F.mse_loss(
+                    full_reconstructed[:, :n_patches, :][valid_mask],
+                    clean_patches[:, :n_patches, :][valid_mask],
+                    reduction="mean",
+                )
+                loss = full_loss if loss is None else loss + full_loss
 
-        # Use target patches (from clean) for masked regions.
-        masked_clean_patches = clean_patches[mask]
-        # In edge cases, the number of reconstructed patches can differ by a small
-        # amount after alignment. Use common prefix to keep training robust.
-        n_masked = min(reconstructed.size(0), masked_clean_patches.size(0))
-        if n_masked <= 0:
-            return None
-        reconstructed = reconstructed[:n_masked]
-        masked_clean_patches = masked_clean_patches[:n_masked]
-
-        # Compute MSE loss on masked patches
-        loss = F.mse_loss(reconstructed, masked_clean_patches, reduction='mean')
-        
-        return loss * self.embedding_loss_weight
+        return loss
 
     def _load_from_state_dict(
         self,

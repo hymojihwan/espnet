@@ -127,6 +127,7 @@ asr_stats_dir= # Specify the directory path for ASR statistics.
 asr_config=    # Config for asr model training.
 asr_args=      # Arguments for asr model training, e.g., "--max_epoch 10".
                # Note that it will overwrite args in asr config.
+use_clean_speech=true       # Load optional clean speech for JEPA-style tasks.
 pretrained_model=              # Pretrained model to load
 ignore_init_mismatch=false      # Ignore initial mismatch
 feats_normalize=global_mvn # Normalizaton layer type.
@@ -262,6 +263,7 @@ Options:
     --asr_args         # Arguments for asr model training (default="${asr_args}").
                        # e.g., --asr_args "--max_epoch 10"
                        # Note that it will overwrite args in asr config.
+    --use_clean_speech # Load paired clean speech when available (default="${use_clean_speech}").
     --pretrained_model=          # Pretrained model to load (default="${pretrained_model}").
     --ignore_init_mismatch=      # Ignore mismatch parameter init with pretrained model (default="${ignore_init_mismatch}").
     --feats_normalize  # Normalizaton layer type (default="${feats_normalize}").
@@ -1313,7 +1315,9 @@ if [ ${stage} -le 10 ] && [ ${stop_stage} -ge 10 ] && ! [[ " ${skip_stages} " =~
 
     _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/${_scp},speech,${_type} "
     _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/${_scp},speech,${_type} "
-    if [ "${asr_task}" = "asr_jepa" ] || [ "${asr_task}" = "asr_transducer" ]; then
+    if ${use_clean_speech} \
+        && { [ "${asr_task}" = "asr_jepa" ] \
+             || [ "${asr_task}" = "asr_transducer" ]; }; then
         _clean_train_scp="$(find_clean_speech_scp "${_asr_train_dir}")"
         _clean_valid_scp="$(find_clean_speech_scp "${_asr_valid_dir}")"
         if [ -n "${_clean_train_scp}" ]; then
@@ -1441,7 +1445,9 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
 
         _opts+="--train_data_path_and_name_and_type ${_split_dir}/${_scp},speech,${_type} "
         _opts+="--train_shape_file ${_split_dir}/speech_shape "
-        if [ "${asr_task}" = "asr_jepa" ] || [ "${asr_task}" = "asr_transducer" ]; then
+        if ${use_clean_speech} \
+            && { [ "${asr_task}" = "asr_jepa" ] \
+                 || [ "${asr_task}" = "asr_transducer" ]; }; then
             _clean_train_scp="$(find_clean_speech_scp "${_asr_train_dir}")"
         else
             _clean_train_scp=""
@@ -1469,7 +1475,9 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
     else
         _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/${_scp},speech,${_type} "
         _opts+="--train_shape_file ${asr_stats_dir}/train/speech_shape "
-        if [ "${asr_task}" = "asr_jepa" ] || [ "${asr_task}" = "asr_transducer" ]; then
+        if ${use_clean_speech} \
+            && { [ "${asr_task}" = "asr_jepa" ] \
+                 || [ "${asr_task}" = "asr_transducer" ]; }; then
             _clean_train_scp="$(find_clean_speech_scp "${_asr_train_dir}")"
             if [ -n "${_clean_train_scp}" ]; then
                 _clean_train_type="$(clean_speech_data_type "${_clean_train_scp}" "${_type}")"
@@ -1492,7 +1500,9 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
         done
     fi
 
-    if [ "${asr_task}" = "asr_jepa" ] || [ "${asr_task}" = "asr_transducer" ]; then
+    if ${use_clean_speech} \
+        && { [ "${asr_task}" = "asr_jepa" ] \
+             || [ "${asr_task}" = "asr_transducer" ]; }; then
         _clean_valid_scp="$(find_clean_speech_scp "${_asr_valid_dir}")"
         if [ -n "${_clean_valid_scp}" ]; then
             _clean_valid_type="$(clean_speech_data_type "${_clean_valid_scp}" "${_type}")"

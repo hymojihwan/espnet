@@ -1,0 +1,70 @@
+# Frozen Conv-TasNet + Conformer CTC with train-only zero patch masking.
+# This isolates the masked-input effect without JEPA or predicted patches.
+batch_type: numel
+batch_bins: 19200000
+accum_grad: 8
+max_epoch: 200
+patience: none
+init: none
+num_att_plot: 0
+log_interval: null
+unused_parameters: false
+
+frontend: frozen_enh
+frontend_conf:
+    enh_train_config: exp/enh_train_enh_convtasnet_small_librispeech960_raw/config.yaml
+    enh_model_file: exp/enh_train_enh_convtasnet_small_librispeech960_raw/valid.loss.best.pth
+    fs: 16k
+    n_fft: 512
+    win_length: 400
+    hop_length: 160
+    n_mels: 80
+    enh_no_grad: true
+    train_zero_mask_ratio: 0.15
+    train_zero_mask_patch_time: 10
+    train_zero_mask_patch_freq: 80
+
+encoder: conformer
+encoder_conf:
+    output_size: 256
+    attention_heads: 4
+    linear_units: 1024
+    num_blocks: 12
+    dropout_rate: 0.1
+    positional_dropout_rate: 0.1
+    attention_dropout_rate: 0.1
+    input_layer: conv2d
+    normalize_before: true
+    macaron_style: true
+    rel_pos_type: latest
+    pos_enc_layer_type: rel_pos
+    selfattention_layer_type: rel_selfattn
+    activation_type: swish
+    use_cnn_module: true
+    cnn_module_kernel: 31
+
+decoder: null
+
+model_conf:
+    ctc_weight: 1.0
+    lsm_weight: 0.1
+    length_normalized_loss: false
+
+optim: adam
+optim_conf:
+    lr: 0.0002
+    weight_decay: 0.000001
+scheduler: warmuplr
+scheduler_conf:
+    warmup_steps: 5000
+
+specaug: null
+use_amp: true
+cudnn_deterministic: false
+cudnn_benchmark: false
+
+best_model_criterion:
+-   - valid
+    - cer_ctc
+    - min
+keep_nbest_models: 10

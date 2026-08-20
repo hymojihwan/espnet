@@ -122,6 +122,10 @@ class ESPnetJEPAASRModel(ESPnetASRModel):
         if isinstance(encoder_out, tuple):
             intermediate_outs = encoder_out[1]
             encoder_out = encoder_out[0]
+        self._last_online_encoder_out = encoder_out if self.training else None
+        self._last_online_encoder_out_lens = (
+            encoder_out_lens if self.training else None
+        )
 
         loss_att, acc_att, cer_att, wer_att = None, None, None, None
         loss_ctc, cer_ctc, wer_ctc = None, None, None
@@ -244,10 +248,9 @@ class ESPnetJEPAASRModel(ESPnetASRModel):
             stats["cer"] = cer_att
             stats["wer"] = wer_att
 
-        # 4. JEPA loss (if JEPA-style frontend and clean speech provided)
+        # 4. JEPA loss (the configured target may not require clean speech)
         if (
             isinstance(self.frontend, (JEPAFrontend, JEPAResidualFrontend, JEPA_MaskedPatchFrontend, JEPA_ViTFrontend, JEPA_HybridFrontend, JEPA_MaskedPatchLatentFrontend, JEPA_BalancedFrontend, JEPAMelLatentFrontend, SE_JEPAFrontend))
-            and clean_speech is not None
             and self.training
         ):
             loss_jepa = self.frontend.compute_jepa_loss()
@@ -282,12 +285,39 @@ class ESPnetJEPAASRModel(ESPnetASRModel):
                 else:
                     loss = jepa_weight * loss_jepa
                 stats["loss_jepa"] = loss_jepa.detach()
+                if hasattr(self.frontend, "get_jepa_loss_stats"):
+                    stats.update(self.frontend.get_jepa_loss_stats())
             else:
                 # If JEPA loss is not available, fall back to CTC/attention loss
                 if loss is None:
                     raise ValueError("Neither JEPA loss nor CTC/attention loss is available")
         elif loss is None:
             raise ValueError("No loss computed: JEPA loss not available and CTC/attention loss not computed")
+
+        if self.training and hasattr(
+            self.frontend, "compute_base_reconstruction_loss"
+        ):
+            loss_base_reconstruction = (
+                self.frontend.compute_base_reconstruction_loss()
+            )
+            base_reconstruction_weight = getattr(
+                self.frontend,
+                "base_reconstruction_loss_weight",
+                0.0,
+            )
+            if (
+                loss_base_reconstruction is not None
+                and base_reconstruction_weight > 0.0
+            ):
+                loss = loss + (
+                    base_reconstruction_weight * loss_base_reconstruction
+                )
+                stats["base_reconstruction_weight"] = (
+                    base_reconstruction_weight
+                )
+                stats["loss_base_reconstruction"] = (
+                    loss_base_reconstruction.detach()
+                )
 
         # Collect total loss stats
         stats["loss"] = loss.detach()

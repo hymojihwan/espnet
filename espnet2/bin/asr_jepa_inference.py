@@ -125,6 +125,9 @@ class Speech2Text:
         threshold_probability: float = 0.99,
         max_seq_len: int = 5,
         max_mask_parallel: int = -1,
+        jepa_inference_mask_ratio: float = 0.0,
+        jepa_inference_residual_weight: float = 1.0,
+        jepa_inference_mask_seed: int = 0,
     ):
 
         task = ASRJEPATask if not enh_s2t_task else EnhS2TTask
@@ -160,6 +163,26 @@ class Speech2Text:
                 ]
             )
         asr_model.to(dtype=getattr(torch, dtype)).eval()
+
+        if jepa_inference_mask_ratio > 0.0:
+            frontend = getattr(asr_model, "frontend", None)
+            if not hasattr(frontend, "configure_masked_residual_inference"):
+                raise ValueError(
+                    "The loaded frontend does not support masked residual "
+                    "JEPA inference"
+                )
+            frontend.configure_masked_residual_inference(
+                jepa_inference_mask_ratio,
+                jepa_inference_residual_weight,
+                jepa_inference_mask_seed,
+            )
+            logger.info(
+                "Use JEPA masked residual inference: mask_ratio=%s, "
+                "residual_weight=%s, seed=%s",
+                jepa_inference_mask_ratio,
+                jepa_inference_residual_weight,
+                jepa_inference_mask_seed,
+            )
 
         if quantize_asr_model:
             logger.info("Use quantized asr model for decoding.")
@@ -774,6 +797,9 @@ def inference(
     threshold_probability: float,
     max_seq_len: int,
     max_mask_parallel: int,
+    jepa_inference_mask_ratio: float,
+    jepa_inference_residual_weight: float,
+    jepa_inference_mask_seed: int,
 ):
     if batch_size > 1:
         raise NotImplementedError("batch decoding is not implemented")
@@ -828,6 +854,9 @@ def inference(
         time_sync=time_sync,
         prompt_token_file=prompt_token_file,
         lang_prompt_token=lang_prompt_token,
+        jepa_inference_mask_ratio=jepa_inference_mask_ratio,
+        jepa_inference_residual_weight=jepa_inference_residual_weight,
+        jepa_inference_mask_seed=jepa_inference_mask_seed,
         nlp_prompt_token=nlp_prompt_token,
         partial_ar=partial_ar,
         threshold_probability=threshold_probability,
@@ -1018,6 +1047,24 @@ def get_parser():
         type=str2bool,
         default=False,
         help="Whether we are using an enhancement and ASR joint model",
+    )
+    group.add_argument(
+        "--jepa_inference_mask_ratio",
+        type=float,
+        default=0.0,
+        help="Deterministic JEPA patch-mask ratio used only during inference",
+    )
+    group.add_argument(
+        "--jepa_inference_residual_weight",
+        type=float,
+        default=1.0,
+        help="Residual fusion weight for reconstructed JEPA patches",
+    )
+    group.add_argument(
+        "--jepa_inference_mask_seed",
+        type=int,
+        default=0,
+        help="Seed for the deterministic JEPA inference patch mask",
     )
     group.add_argument(
         "--multi_asr",

@@ -44,6 +44,7 @@ class SE_JEPAFrontend(AbsFrontend):
         se_model_file: Optional[str] = None,
         se_no_grad: bool = True,
         observation_addition: bool = False,
+        observation_addition_after_jepa: bool = False,
         enhanced_weight: float = 0.8,
         noisy_weight: float = 0.2,
         rms_alignment_eps: float = 1.0e-8,
@@ -54,6 +55,10 @@ class SE_JEPAFrontend(AbsFrontend):
             raise ValueError("Observation-addition weights must be non-negative")
         if observation_addition and enhanced_weight + noisy_weight <= 0.0:
             raise ValueError("At least one observation-addition weight must be positive")
+        if observation_addition_after_jepa and not observation_addition:
+            raise ValueError(
+                "observation_addition_after_jepa requires observation_addition=True"
+            )
 
         if jepa_frontend is not None:
             self.jepa_frontend = jepa_frontend
@@ -61,11 +66,12 @@ class SE_JEPAFrontend(AbsFrontend):
             self.jepa_frontend = JEPA_MaskedPatchFrontend(**jepa_frontend_conf)
         else:
             raise ValueError("Either jepa_frontend or jepa_frontend_conf must be provided")
-        self.output_dim = self.jepa_frontend.output_dim
+        self.output_dim = self.jepa_frontend.output_size()
 
         self.se_no_grad = se_no_grad
         self.se_mode = "asteroid"
         self.observation_addition = observation_addition
+        self.observation_addition_after_jepa = observation_addition_after_jepa
         weight_sum = enhanced_weight + noisy_weight
         self.enhanced_weight = enhanced_weight / weight_sum
         self.noisy_weight = noisy_weight / weight_sum
@@ -121,6 +127,14 @@ class SE_JEPAFrontend(AbsFrontend):
     @property
     def embedding_loss_weight(self) -> float:
         return getattr(self.jepa_frontend, "embedding_loss_weight", 1.0)
+
+    @property
+    def base_reconstruction_loss_weight(self) -> float:
+        return getattr(
+            self.jepa_frontend,
+            "base_reconstruction_loss_weight",
+            0.0,
+        )
 
     def output_size(self) -> int:
         return self.output_dim
@@ -181,6 +195,7 @@ class SE_JEPAFrontend(AbsFrontend):
         speech_lengths = input_lengths.to(device=enhanced_wav.device, dtype=torch.long)
         speech_lengths = torch.clamp(speech_lengths, max=min_len)
 
+        asr_input_wav = None
         if self.observation_addition:
             sample_ids = torch.arange(min_len, device=enhanced_wav.device)
             valid_mask = sample_ids.unsqueeze(0) < speech_lengths.unsqueeze(1)
@@ -196,10 +211,15 @@ class SE_JEPAFrontend(AbsFrontend):
                 / num_samples
                 + self.rms_alignment_eps
             )
-            enhanced_wav = enhanced_wav * (noisy_rms / enhanced_rms)
-            enhanced_wav = (
-                self.enhanced_weight * enhanced_wav + self.noisy_weight * input_trim
+            rms_aligned_enhanced_wav = enhanced_wav * (noisy_rms / enhanced_rms)
+            observation_added_wav = (
+                self.enhanced_weight * rms_aligned_enhanced_wav
+                + self.noisy_weight * input_trim
             ) * valid_mask
+            if self.observation_addition_after_jepa:
+                asr_input_wav = observation_added_wav
+            else:
+                enhanced_wav = observation_added_wav
 
         if clean_input is not None and clean_input.dim() >= 2:
             clean_for_jepa = clean_input[..., :min_len]
@@ -218,6 +238,8 @@ class SE_JEPAFrontend(AbsFrontend):
             speech_lengths,
             clean_input=clean_for_jepa,
             clean_input_lengths=clean_lengths_for_jepa,
+            asr_input=asr_input_wav,
+            asr_input_lengths=speech_lengths if asr_input_wav is not None else None,
         )
 
         return feats, feats_lengths
@@ -232,6 +254,29 @@ class SE_JEPAFrontend(AbsFrontend):
         if weight == 0.0:
             return loss.detach() * 0.0
         return loss / weight
+
+    def get_jepa_loss_stats(self) -> Dict[str, torch.Tensor]:
+        """Return component losses reported by the inner JEPA frontend."""
+        if hasattr(self.jepa_frontend, "get_jepa_loss_stats"):
+            return self.jepa_frontend.get_jepa_loss_stats()
+        return {}
+
+    def compute_base_reconstruction_loss(self) -> Optional[torch.Tensor]:
+        """Return the unweighted masked Base Mel reconstruction loss."""
+        return self.jepa_frontend.compute_base_reconstruction_loss()
+
+    def configure_masked_residual_inference(
+        self,
+        mask_ratio: float,
+        residual_weight: float,
+        seed: int = 0,
+    ) -> None:
+        """Configure masked residual reconstruction in the JEPA frontend."""
+        self.jepa_frontend.configure_masked_residual_inference(
+            mask_ratio,
+            residual_weight,
+            seed,
+        )
 
     def compute_se_loss(self) -> Optional[torch.Tensor]:
         """SI-SNR loss: enhanced_wav vs clean_wav (ref=clean, est=enhanced)."""

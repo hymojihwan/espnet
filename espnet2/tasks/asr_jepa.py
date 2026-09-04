@@ -23,6 +23,7 @@ from espnet2.asr.frontend.jepa_balanced import JEPA_BalancedFrontend
 from espnet2.asr.frontend.jepa_mel_latent import JEPAMelLatentFrontend
 from espnet2.asr.frontend.frozen_enh import FrozenEnhFrontend
 from espnet2.asr.frontend.se_jepa import SE_JEPAFrontend
+from espnet2.asr.frontend.se_meta_bridge import SEMetaBridgeFrontend
 from espnet2.tasks.asr import (
     ASRTask,
     decoder_choices,
@@ -51,6 +52,7 @@ frontend_choices = ClassChoices(
         jepa_balanced=JEPA_BalancedFrontend,
         jepa_mel_latent=JEPAMelLatentFrontend,
         se_jepa=SE_JEPAFrontend,
+        se_meta_bridge=SEMetaBridgeFrontend,
     ),
     type_check=base_frontend_choices.base_type,
     default=base_frontend_choices.default,

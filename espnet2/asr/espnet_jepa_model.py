@@ -98,13 +98,26 @@ class ESPnetJEPAASRModel(ESPnetASRModel):
         ):
             return
 
+        # A Meta-BRIDGE experiment may train the ASR in the offline outer
+        # loop while keeping the SE and reconstruction network frozen.  Only
+        # force modules without trainable parameters into eval mode; otherwise
+        # this helper would silently disable dropout/statistics updates for a
+        # trainable ASR even though its gradients remain enabled.
         for module_name in ("encoder", "ctc", "decoder"):
             module = getattr(self, module_name, None)
-            if module is not None:
+            if module is not None and not any(
+                parameter.requires_grad for parameter in module.parameters()
+            ):
                 module.eval()
 
         se_model = getattr(self.frontend, "se_model", None)
-        if se_model is not None:
+        se_no_grad = getattr(self.frontend, "se_no_grad", False)
+        if se_model is not None and (
+            se_no_grad
+            or not any(
+                parameter.requires_grad for parameter in se_model.parameters()
+            )
+        ):
             se_model.eval()
 
         if hasattr(meta_frontend, "enforce_meta_loss_network_eval"):

@@ -211,6 +211,8 @@ class MetaBridgeFrontend(JEPA_MaskedPatchFrontend):
         )
         self._last_meta_loss = None
         self._last_jepa_loss_stats = {}
+        self._last_meta_support_mask = None
+        self._last_meta_query_mask = None
         adaptation_enabled = should_adapt and self.meta_inner_steps > 0
         if (
             not adaptation_enabled
@@ -366,6 +368,7 @@ class MetaBridgeFrontend(JEPA_MaskedPatchFrontend):
             feature_lengths,
             **inner_kwargs,
         )
+        self._last_meta_support_mask = support_mask.detach()
         if query_mask is None:
             if self.training:
                 adapted_features = self.meta_adapter(

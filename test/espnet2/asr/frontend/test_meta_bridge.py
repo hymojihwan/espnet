@@ -139,6 +139,59 @@ def test_meta_bridge_validation_adaptation_is_per_sample(monkeypatch):
     assert frontend.compute_jepa_loss() is None
 
 
+def test_meta_bridge_adapter_query_is_unmasked_target_free_and_episodic(
+    monkeypatch,
+):
+    frontend = make_frontend(
+        meta_query_input_mode="adapter",
+        meta_train_per_sample=True,
+        meta_outer_support_loss=False,
+        meta_inner_eval_mode=True,
+    )
+    waveform = torch.randn(1, 640)
+    lengths = torch.tensor([640], dtype=torch.long)
+    clean_a = torch.randn_like(waveform)
+    clean_b = torch.randn_like(waveform)
+    before = {
+        name: parameter.detach().clone()
+        for name, parameter in frontend.meta_adapter.named_parameters()
+    }
+
+    def reject_masked_hybrid(*args, **kwargs):
+        raise AssertionError("adapter query must not reconstruct query patches")
+
+    monkeypatch.setattr(
+        frontend,
+        "_build_bridge_query",
+        reject_masked_hybrid,
+    )
+    frontend.eval()
+    with torch.no_grad():
+        first, first_lengths = frontend(
+            waveform,
+            lengths,
+            clean_input=clean_a,
+            clean_input_lengths=lengths,
+        )
+        second, second_lengths = frontend(
+            waveform,
+            lengths,
+            clean_input=clean_b,
+            clean_input_lengths=lengths,
+        )
+
+    # Clean speech is ignored, the ASR query has the original frame layout,
+    # and each call starts from the same persistent adapter initialization.
+    assert torch.equal(first, second)
+    assert torch.equal(first_lengths, second_lengths)
+    assert first.shape == (1, 41, 8)
+    assert frontend.get_jepa_loss_stats()["meta_feature_delta_rms"] > 0.0
+    assert frontend._last_meta_support_mask is not None
+    assert frontend._last_meta_query_mask is None
+    for name, parameter in frontend.meta_adapter.named_parameters():
+        assert torch.equal(before[name], parameter)
+
+
 def test_meta_bridge_inner_eval_mode_restores_training_state(monkeypatch):
     frontend = make_frontend(
         dropout_rate=0.5,
@@ -211,6 +264,7 @@ def test_meta_freeze_backbone_eval_is_opt_in(enabled):
     wrapper = nn.Module()
     wrapper.jepa_frontend = meta_frontend
     wrapper.se_model = nn.Sequential(nn.Linear(8, 8), nn.Dropout(0.5))
+    wrapper.se_no_grad = enabled
 
     model = ESPnetJEPAASRModel.__new__(ESPnetJEPAASRModel)
     nn.Module.__init__(model)
@@ -218,6 +272,22 @@ def test_meta_freeze_backbone_eval_is_opt_in(enabled):
     model.encoder = nn.Sequential(nn.Linear(8, 8), nn.Dropout(0.5))
     model.ctc = nn.Sequential(nn.Linear(8, 8), nn.Dropout(0.5))
     model.decoder = nn.Sequential(nn.Linear(8, 8), nn.Dropout(0.5))
+    if enabled:
+        frozen_modules = (
+            model.encoder,
+            model.ctc,
+            model.decoder,
+            wrapper.se_model,
+            meta_frontend.context_patch_embed,
+            meta_frontend.context_encoder,
+            meta_frontend.predictor,
+            meta_frontend.decoder,
+        )
+        for module in frozen_modules:
+            if module is None:
+                continue
+            for parameter in module.parameters():
+                parameter.requires_grad = False
     model.train()
 
     model._enforce_meta_frozen_backbone_eval()
@@ -236,12 +306,57 @@ def test_meta_freeze_backbone_eval_is_opt_in(enabled):
     assert meta_frontend.meta_adapter.training
 
     if enabled:
-        for module in (model.encoder, model.ctc, model.decoder):
-            for parameter in module.parameters():
-                parameter.requires_grad = False
         adapter_input = torch.randn(1, 3, 8, requires_grad=True)
         model.encoder(adapter_input).sum().backward()
         assert adapter_input.grad is not None
+
+
+def test_meta_frozen_eval_keeps_outer_trainable_asr_in_train_mode():
+    meta_frontend = make_frontend(meta_freeze_backbone_eval=True)
+    wrapper = nn.Module()
+    wrapper.jepa_frontend = meta_frontend
+    wrapper.se_model = nn.Sequential(nn.Linear(8, 8), nn.Dropout(0.5))
+    wrapper.se_no_grad = True
+
+    model = ESPnetJEPAASRModel.__new__(ESPnetJEPAASRModel)
+    nn.Module.__init__(model)
+    model.frontend = wrapper
+    model.encoder = nn.Sequential(nn.Linear(8, 8), nn.Dropout(0.5))
+    model.ctc = nn.Sequential(nn.Linear(8, 8), nn.Dropout(0.5))
+    model.decoder = None
+
+    # SE and the SSL reconstruction head are frozen; the ASR is updated only
+    # by the supervised outer objective during offline meta-training.
+    for module in (
+        wrapper.se_model,
+        meta_frontend.context_patch_embed,
+        meta_frontend.context_encoder,
+        meta_frontend.predictor,
+        meta_frontend.decoder,
+    ):
+        if module is None:
+            continue
+        for parameter in module.parameters():
+            parameter.requires_grad = False
+
+    model.train()
+    model._enforce_meta_frozen_backbone_eval()
+
+    assert model.encoder.training
+    assert model.ctc.training
+    assert not wrapper.se_model.training
+    assert not meta_frontend.context_encoder.training
+    assert not meta_frontend.predictor.training
+    assert not meta_frontend.decoder.training
+    assert meta_frontend.training
+    assert meta_frontend.meta_adapter.training
+
+    adapter_input = torch.randn(1, 3, 8, requires_grad=True)
+    outer_loss = model.ctc(model.encoder(adapter_input)).sum()
+    outer_loss.backward()
+    assert adapter_input.grad is not None
+    assert next(model.encoder.parameters()).grad is not None
+    assert next(model.ctc.parameters()).grad is not None
 
 
 def test_meta_bridge_adapts_inside_no_grad():

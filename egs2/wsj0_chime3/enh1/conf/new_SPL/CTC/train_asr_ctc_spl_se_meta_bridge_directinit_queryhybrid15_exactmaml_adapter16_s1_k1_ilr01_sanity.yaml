@@ -1,0 +1,138 @@
+# Four-iteration WSJ0+CHiME-3 plumbing and memory check for exact Meta-BRIDGE.
+batch_type: numel
+batch_bins: 4800000
+accum_grad: 1
+max_epoch: 1
+patience: none
+num_iters_per_epoch: 4
+init: none
+num_att_plot: 0
+log_interval: 1
+unused_parameters: false
+
+init_param:
+    - exp/-5to15/asr_train_asr_ctc_spl_se_jepa_predhybrid15_p10x80_transformer_parammatch_basejepa_w008_smalldata_raw_bpe2048/valid.cer_ctc.ave_10best.pth
+ignore_init_mismatch: true
+freeze_param:
+    - frontend.se_model
+    - frontend.jepa_frontend.mask_token
+    - frontend.jepa_frontend.context_patch_embed
+    - frontend.jepa_frontend.context_encoder
+    - frontend.jepa_frontend.target_patch_embed
+    - frontend.jepa_frontend.target_encoder
+    - frontend.jepa_frontend.predictor
+    - frontend.jepa_frontend.decoder
+    - encoder
+    - ctc
+save_strategy: all
+
+model: se_jepa_espnet
+model_conf:
+    ctc_weight: 1.0
+    lsm_weight: 0.1
+    length_normalized_loss: false
+    se_loss_weight: 0.0
+    encoder_distill_weight: 0.0
+
+frontend: se_meta_bridge
+frontend_conf:
+    se_train_config: exp/-5to15/SPL/SE_Experiments/ConvTasNet/enh_enh_train_enh_conv_tasnet_small_raw_resumefalse/config.yaml
+    se_model_file: exp/-5to15/SPL/SE_Experiments/ConvTasNet/enh_enh_train_enh_conv_tasnet_small_raw_resumefalse/valid.loss.best.pth
+    se_no_grad: true
+    use_asteroid_convtasnet: false
+    meta_bridge_conf:
+        output_dim: 80
+        embedding_dim: 112
+        context_encoder_dim: 112
+        target_encoder_dim: 112
+        predictor_dim: 112
+        decoder_dim: 112
+        num_context_encoder_layers: 2
+        num_target_encoder_layers: 2
+        num_predictor_layers: 2
+        num_decoder_layers: 2
+        patch_size: [10, 80]
+        mask_ratio: 0.15
+        dropout_rate: 0.1
+        encoder_type: transformer
+        encoder_conf:
+            num_layers: 1
+            num_heads: 4
+            ff_dim: 224
+            dropout_rate: 0.1
+            attn_dropout_rate: 0.1
+            use_positional_encoding: true
+        predictor_type: transformer
+        predictor_conf:
+            num_layers: 1
+            num_heads: 4
+            ff_dim: 224
+            dropout_rate: 0.1
+            attn_dropout_rate: 0.1
+            use_positional_encoding: true
+        decoder_type: mlp
+        asr_input_mode: base
+        n_fft: 512
+        win_length: 400
+        hop_length: 160
+        fs: 16000
+        n_mels: 80
+        embedding_loss_weight: 0.08
+        enable_jepa_loss: true
+        latent_loss_type: mel_reconstruction
+        mel_reconstruction_target: base
+        ema_decay: 0.999
+        meta_adapter_dim: 16
+        meta_adapter_scale: 1.0
+        meta_inner_lr: 0.1
+        meta_inner_steps: 1
+        meta_first_order: false
+        meta_gradient_clip: 1.0
+        meta_adapt_during_training: true
+        meta_adapt_at_inference: true
+        meta_train_per_sample: true
+        meta_outer_support_loss: false
+        meta_inner_eval_mode: true
+        meta_freeze_backbone_eval: true
+        meta_inference_seed: 0
+        meta_query_input_mode: bridge_hybrid
+        meta_query_mask_ratio: 0.15
+        meta_query_residual_weight: 1.0
+        meta_query_mask_seed: 1000
+        meta_disjoint_support_query: true
+
+encoder: conformer
+encoder_conf:
+    output_size: 256
+    attention_heads: 4
+    linear_units: 1024
+    num_blocks: 12
+    dropout_rate: 0.1
+    positional_dropout_rate: 0.1
+    attention_dropout_rate: 0.1
+    input_layer: conv2d
+    normalize_before: true
+    macaron_style: true
+    rel_pos_type: latest
+    pos_enc_layer_type: rel_pos
+    selfattention_layer_type: rel_selfattn
+    activation_type: swish
+    use_cnn_module: true
+    cnn_module_kernel: 31
+
+decoder: null
+
+optim: adam
+optim_conf:
+    lr: 0.0001
+    weight_decay: 0.000001
+scheduler: null
+
+specaug: null
+use_amp: true
+cudnn_deterministic: false
+cudnn_benchmark: false
+
+best_model_criterion:
+    - [valid, cer_ctc, min]
+keep_nbest_models: 1

@@ -78,6 +78,38 @@ class ESPnetJEPAASRModel(ESPnetASRModel):
         # Step counter for CTC weight scheduling (will be updated during training)
         self.register_buffer("_ctc_weight_step", torch.tensor(0, dtype=torch.long))
 
+    def _enforce_meta_frozen_backbone_eval(self) -> None:
+        """Keep explicitly frozen Meta-BRIDGE components in eval mode.
+
+        ``requires_grad=False`` prevents parameter updates but does not stop a
+        trainer-level ``model.train()`` call from enabling dropout or running
+        statistics.  Meta-BRIDGE can opt into deterministic frozen backbones
+        while retaining gradients through them to the meta adapter.
+        """
+        meta_frontend = getattr(
+            self.frontend,
+            "jepa_frontend",
+            self.frontend,
+        )
+        if not getattr(
+            meta_frontend,
+            "meta_freeze_backbone_eval",
+            False,
+        ):
+            return
+
+        for module_name in ("encoder", "ctc", "decoder"):
+            module = getattr(self, module_name, None)
+            if module is not None:
+                module.eval()
+
+        se_model = getattr(self.frontend, "se_model", None)
+        if se_model is not None:
+            se_model.eval()
+
+        if hasattr(meta_frontend, "enforce_meta_loss_network_eval"):
+            meta_frontend.enforce_meta_loss_network_eval()
+
     def forward(
         self,
         speech: torch.Tensor,
@@ -99,6 +131,7 @@ class ESPnetJEPAASRModel(ESPnetASRModel):
             clean_speech_lengths: Optional (Batch, ) - Clean speech lengths
             kwargs: "utt_id" is among the input.
         """
+        self._enforce_meta_frozen_backbone_eval()
         assert text_lengths.dim() == 1, text_lengths.shape
         # Check that batch_size is unified
         assert (
@@ -285,14 +318,20 @@ class ESPnetJEPAASRModel(ESPnetASRModel):
                 else:
                     loss = jepa_weight * loss_jepa
                 stats["loss_jepa"] = loss_jepa.detach()
-                if hasattr(self.frontend, "get_jepa_loss_stats"):
-                    stats.update(self.frontend.get_jepa_loss_stats())
             else:
                 # If JEPA loss is not available, fall back to CTC/attention loss
                 if loss is None:
                     raise ValueError("Neither JEPA loss nor CTC/attention loss is available")
         elif loss is None:
             raise ValueError("No loss computed: JEPA loss not available and CTC/attention loss not computed")
+
+        # Diagnostic Meta-BRIDGE statistics remain useful when its outer
+        # support loss is disabled and compute_jepa_loss() therefore returns
+        # None.  Collect component stats independently of loss composition.
+        if hasattr(self.frontend, "get_jepa_loss_stats"):
+            # Meta-BRIDGE also adapts and constructs its BRIDGE query during
+            # validation, so keep the support/query diagnostics in valid logs.
+            stats.update(self.frontend.get_jepa_loss_stats())
 
         if self.training and hasattr(
             self.frontend, "compute_base_reconstruction_loss"

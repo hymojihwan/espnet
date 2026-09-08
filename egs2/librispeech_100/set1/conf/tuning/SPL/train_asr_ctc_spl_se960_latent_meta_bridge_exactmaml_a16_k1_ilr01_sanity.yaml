@@ -1,0 +1,97 @@
+# Four-iteration smoke test for latent-space Meta-BRIDGE.
+batch_type: numel
+batch_bins: 800000
+accum_grad: 1
+max_epoch: 1
+num_iters_per_epoch: 4
+patience: none
+init: none
+num_att_plot: 0
+log_interval: 1
+unused_parameters: false
+
+init_param:
+    - exp_SPL/BRIDGE_v1/Complete/CTC/asr_asr_ctc_spl_se960_predhybrid15_p10x80_transformer_parammatch_basejepa_w008_asr_100h_noisy_matchaed_main/valid.cer_ctc.ave_10best.pth:encoder:encoder
+    - exp_SPL/BRIDGE_v1/Complete/CTC/asr_asr_ctc_spl_se960_predhybrid15_p10x80_transformer_parammatch_basejepa_w008_asr_100h_noisy_matchaed_main/valid.cer_ctc.ave_10best.pth:ctc:ctc
+ignore_init_mismatch: false
+freeze_param:
+    - frontend
+    - encoder
+    - ctc
+save_strategy: all
+
+model: jepa_espnet
+model_conf:
+    ctc_weight: 1.0
+    lsm_weight: 0.1
+    length_normalized_loss: false
+    latent_meta_bridge_conf:
+        latent_dim: 112
+        adapter_dim: 16
+        adapter_scale: 1.0
+        predictor_layers: 1
+        predictor_heads: 4
+        predictor_ff_dim: 224
+        dropout_rate: 0.0
+        mask_ratio: 0.15
+        mask_span: 3
+        inner_lr: 0.1
+        inner_steps: 1
+        first_order: false
+        gradient_clip: 1.0
+        adapt_during_training: true
+        adapt_at_inference: true
+        train_per_sample: true
+        ema_decay: 0.999
+        inference_seed: 0
+        loss_type: cosine
+
+frontend: frozen_enh
+frontend_conf:
+    enh_train_config: exp/enh_train_enh_convtasnet_small_librispeech960_raw/config.yaml
+    enh_model_file: exp/enh_train_enh_convtasnet_small_librispeech960_raw/valid.loss.best.pth
+    enh_no_grad: true
+    fs: 16000
+    n_fft: 512
+    win_length: 400
+    hop_length: 160
+    n_mels: 80
+
+normalize: utterance_mvn
+normalize_conf: {}
+
+encoder: conformer
+encoder_conf:
+    output_size: 256
+    attention_heads: 4
+    linear_units: 1024
+    num_blocks: 12
+    dropout_rate: 0.1
+    positional_dropout_rate: 0.1
+    attention_dropout_rate: 0.1
+    input_layer: conv2d
+    normalize_before: true
+    macaron_style: true
+    rel_pos_type: latest
+    pos_enc_layer_type: rel_pos
+    selfattention_layer_type: rel_selfattn
+    activation_type: swish
+    use_cnn_module: true
+    cnn_module_kernel: 31
+
+decoder: null
+
+optim: adam
+optim_conf:
+    lr: 0.00005
+    weight_decay: 0.000001
+scheduler: null
+
+specaug: null
+use_amp: false
+cudnn_deterministic: true
+cudnn_benchmark: false
+
+best_model_criterion:
+    - [valid, cer_ctc, min]
+keep_nbest_models: 1

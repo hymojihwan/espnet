@@ -321,27 +321,24 @@ class ConformerEncoder(AbsEncoder):
     def output_size(self) -> int:
         return self._output_size
 
-    def forward(
+    def forward_embedding(
         self,
         xs_pad: torch.Tensor,
         ilens: torch.Tensor,
-        prev_states: torch.Tensor = None,
-        ctc: CTC = None,
-        return_all_hs: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Calculate forward propagation.
+    ) -> Tuple[
+        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], torch.Tensor
+    ]:
+        """Apply the input embedding or subsampling layer.
 
         Args:
             xs_pad (torch.Tensor): Input tensor (#batch, L, input_size).
-            ilens (torch.Tensor): Input length (#batch).
-            prev_states (torch.Tensor): Not to be used now.
-            ctc (CTC): ctc module for intermediate CTC loss
-            return_all_hs (bool): whether to return all hidden states
+            ilens (torch.Tensor): Input lengths (#batch).
 
         Returns:
-            torch.Tensor: Output tensor (#batch, L, output_size).
-            torch.Tensor: Output length (#batch).
-            torch.Tensor: Not to be used now.
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+                Embedded input. Relative-position encoders return a pair of the
+                embedded sequence and its positional embedding.
+            torch.Tensor: Valid-position mask (#batch, 1, embedded_length).
 
         """
         masks = (~make_pad_mask(ilens)[:, None, :]).to(xs_pad.device)
@@ -365,6 +362,35 @@ class ConformerEncoder(AbsEncoder):
         else:
             xs_pad = self.embed(xs_pad)
 
+        return xs_pad, masks
+
+    def forward_from_embedding(
+        self,
+        xs_pad: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        masks: torch.Tensor,
+        ctc: CTC = None,
+        return_all_hs: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Run the Conformer blocks from an already embedded input.
+
+        This entry point preserves the relative-position tuple and mask returned
+        by :meth:`forward_embedding`, allowing callers to transform only the
+        subsampled representation before the Conformer stack.
+
+        Args:
+            xs_pad (Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]):
+                Embedded input, optionally paired with a positional embedding.
+            masks (torch.Tensor): Valid-position mask (#batch, 1, L).
+            ctc (CTC): CTC module for intermediate CTC loss.
+            return_all_hs (bool): Whether to return all hidden states.
+
+        Returns:
+            torch.Tensor: Output tensor (#batch, L, output_size), optionally
+                paired with intermediate outputs as in :meth:`forward`.
+            torch.Tensor: Output lengths (#batch).
+            torch.Tensor: Not used; always ``None``.
+
+        """
         intermediate_outs = []
         if len(self.interctc_layer_idx) == 0:
             for layer_idx, encoder_layer in enumerate(self.encoders):
@@ -420,3 +446,29 @@ class ConformerEncoder(AbsEncoder):
         if len(intermediate_outs) > 0:
             return (xs_pad, intermediate_outs), olens, None
         return xs_pad, olens, None
+
+    def forward(
+        self,
+        xs_pad: torch.Tensor,
+        ilens: torch.Tensor,
+        prev_states: torch.Tensor = None,
+        ctc: CTC = None,
+        return_all_hs: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Calculate forward propagation.
+
+        Args:
+            xs_pad (torch.Tensor): Input tensor (#batch, L, input_size).
+            ilens (torch.Tensor): Input length (#batch).
+            prev_states (torch.Tensor): Not to be used now.
+            ctc (CTC): ctc module for intermediate CTC loss
+            return_all_hs (bool): whether to return all hidden states
+
+        Returns:
+            torch.Tensor: Output tensor (#batch, L, output_size).
+            torch.Tensor: Output length (#batch).
+            torch.Tensor: Not to be used now.
+
+        """
+        xs_pad, masks = self.forward_embedding(xs_pad, ilens)
+        return self.forward_from_embedding(xs_pad, masks, ctc, return_all_hs)

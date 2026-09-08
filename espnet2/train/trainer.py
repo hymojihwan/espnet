@@ -799,6 +799,8 @@ class Trainer:
                             frontend.update_target_encoder()
                         if hasattr(core_model, "update_asr_teacher_encoder"):
                             core_model.update_asr_teacher_encoder()
+                        if hasattr(core_model, "update_latent_target_encoder"):
+                            core_model.update_latent_target_encoder()
                 for iopt, optimizer in enumerate(optimizers):
                     if optim_idx is not None and iopt != optim_idx:
                         continue

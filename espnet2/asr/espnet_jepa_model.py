@@ -22,6 +22,7 @@ from espnet2.asr.frontend.jepa_audio import JEPA_MaskedPatchLatentFrontend
 from espnet2.asr.frontend.jepa_balanced import JEPA_BalancedFrontend
 from espnet2.asr.frontend.jepa_mel_latent import JEPAMelLatentFrontend
 from espnet2.asr.frontend.se_jepa import SE_JEPAFrontend
+from espnet2.asr.latent_bridge import LatentBridge
 from espnet2.asr.latent_meta_bridge import LatentMetaBridge
 from espnet2.asr_transducer.utils import get_transducer_task_io
 from espnet2.torch_utils.device_funcs import force_gatherable
@@ -53,6 +54,7 @@ class ESPnetJEPAASRModel(ESPnetASRModel):
         ctc_weight_start = kwargs.get("ctc_weight_start", 0.01)
         ctc_weight_end = kwargs.get("ctc_weight_end", 1.0)
         ctc_weight_warmup_steps = kwargs.get("ctc_weight_warmup_steps", 10000)
+        latent_bridge_conf = kwargs.pop("latent_bridge_conf", None)
         latent_meta_bridge_conf = kwargs.pop("latent_meta_bridge_conf", None)
         latent_meta_freeze_backbone_eval = kwargs.pop(
             "latent_meta_freeze_backbone_eval",
@@ -69,10 +71,43 @@ class ESPnetJEPAASRModel(ESPnetASRModel):
         
         super().__init__(*args, **kwargs)
 
+        if latent_bridge_conf is not None and latent_meta_bridge_conf is not None:
+            raise ValueError(
+                "latent_bridge_conf and latent_meta_bridge_conf are mutually "
+                "exclusive"
+            )
+
+        self.latent_bridge = None
         self.latent_meta_bridge = None
         self.latent_meta_freeze_backbone_eval = bool(
             latent_meta_freeze_backbone_eval
         )
+        if latent_bridge_conf is not None:
+            if not isinstance(latent_bridge_conf, dict):
+                raise TypeError("latent_bridge_conf must be a dictionary")
+            if not all(
+                hasattr(self.encoder, method_name)
+                for method_name in (
+                    "forward_embedding",
+                    "forward_from_embedding",
+                )
+            ):
+                raise TypeError(
+                    "Latent BRIDGE requires an encoder exposing "
+                    "forward_embedding() and forward_from_embedding()"
+                )
+            latent_bridge_conf = dict(latent_bridge_conf)
+            encoder_output_size = self.encoder.output_size()
+            configured_input_dim = latent_bridge_conf.setdefault(
+                "input_dim",
+                encoder_output_size,
+            )
+            if configured_input_dim != encoder_output_size:
+                raise ValueError(
+                    "Latent BRIDGE input_dim must match the encoder embedding "
+                    f"size ({encoder_output_size}), got {configured_input_dim}"
+                )
+            self.latent_bridge = LatentBridge(**latent_bridge_conf)
         if latent_meta_bridge_conf is not None:
             if not isinstance(latent_meta_bridge_conf, dict):
                 raise TypeError("latent_meta_bridge_conf must be a dictionary")
@@ -137,7 +172,10 @@ class ESPnetJEPAASRModel(ESPnetASRModel):
             False,
         )
         freeze_latent_backbone = (
-            self.latent_meta_bridge is not None
+            (
+                self.latent_bridge is not None
+                or self.latent_meta_bridge is not None
+            )
             and self.latent_meta_freeze_backbone_eval
         )
         if not (freeze_frontend_backbone or freeze_latent_backbone):
@@ -391,6 +429,20 @@ class ESPnetJEPAASRModel(ESPnetASRModel):
         elif loss is None:
             raise ValueError("No loss computed: JEPA loss not available and CTC/attention loss not computed")
 
+        # Phase-1 latent BRIDGE uses the same enhanced utterance on both
+        # branches.  Its masked EMA-target loss is optimized jointly with the
+        # recognizer; it never consumes paired clean speech.
+        if self.training and self.latent_bridge is not None:
+            loss_latent_bridge = self.latent_bridge.compute_loss()
+            if loss_latent_bridge is None:
+                raise RuntimeError(
+                    "Latent BRIDGE did not produce a training loss"
+                )
+            latent_bridge_weight = self.latent_bridge.loss_weight
+            loss = loss + latent_bridge_weight * loss_latent_bridge
+            stats["loss_latent_bridge"] = loss_latent_bridge.detach()
+            stats["latent_bridge_weight"] = latent_bridge_weight
+
         # Diagnostic Meta-BRIDGE statistics remain useful when its outer
         # support loss is disabled and compute_jepa_loss() therefore returns
         # None.  Collect component stats independently of loss composition.
@@ -398,6 +450,8 @@ class ESPnetJEPAASRModel(ESPnetASRModel):
             # Meta-BRIDGE also adapts and constructs its BRIDGE query during
             # validation, so keep the support/query diagnostics in valid logs.
             stats.update(self.frontend.get_jepa_loss_stats())
+        if self.latent_bridge is not None:
+            stats.update(self.latent_bridge.get_stats())
         if self.latent_meta_bridge is not None:
             stats.update(self.latent_meta_bridge.get_stats())
 
@@ -533,7 +587,12 @@ class ESPnetJEPAASRModel(ESPnetASRModel):
             self.encoder.interctc_use_conditioning
             or getattr(self.encoder, "ctc_trim", False)
         )
-        if self.latent_meta_bridge is not None:
+        latent_bridge_module = (
+            self.latent_bridge
+            if self.latent_bridge is not None
+            else self.latent_meta_bridge
+        )
+        if latent_bridge_module is not None:
             embedded, encoder_masks = self.encoder.forward_embedding(
                 feats,
                 feats_lengths,
@@ -550,7 +609,7 @@ class ESPnetJEPAASRModel(ESPnetASRModel):
                 positional_state = None
 
             latent_lengths = encoder_masks.squeeze(1).sum(1)
-            aligned_latent, aligned_lengths = self.latent_meta_bridge(
+            aligned_latent, aligned_lengths = latent_bridge_module(
                 base_latent,
                 latent_lengths,
             )
@@ -671,6 +730,8 @@ class ESPnetJEPAASRModel(ESPnetASRModel):
 
     @torch.no_grad()
     def update_latent_target_encoder(self) -> None:
-        """EMA-update the optional latent target encoder."""
+        """EMA-update the configured latent target encoder."""
+        if self.latent_bridge is not None:
+            self.latent_bridge.update_target_encoder()
         if self.latent_meta_bridge is not None:
             self.latent_meta_bridge.update_target_encoder()

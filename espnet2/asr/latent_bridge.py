@@ -2,11 +2,13 @@
 
 import copy
 import math
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from espnet2.asr.ajepa_spectrogram_mask import AJEPASpectrogramMask
 
 
 class _ResidualTransformerPath(nn.Module):
@@ -104,12 +106,10 @@ class _ResidualTransformerPath(nn.Module):
 class LatentBridge(nn.Module):
     """Predict masked enhanced-speech latents with an EMA teacher.
 
-    During training, valid time steps are masked before an online contextual
-    encoder.  A predictor estimates the unmasked representation produced by
-    an exponential-moving-average copy of that encoder.  The sequence passed
-    to ASR is a hybrid of predicted masked positions and online-context
-    features at unmasked positions.  Evaluation uses no masking and returns
-    the complete online context path.
+    The legacy mode masks valid latent time steps and sends a predicted/context
+    hybrid to ASR.  The optional A-JEPA-inspired mode instead creates a
+    structured masked spectrogram view for the SSL path while both training
+    and evaluation send the complete unmasked online representation to ASR.
 
     The module consumes and returns the same latent dimension (256 by
     default), uses no clean-speech target, and contains no waveform or Mel
@@ -133,6 +133,20 @@ class LatentBridge(nn.Module):
         ema_decay: float = 0.999,
         loss_type: str = "cosine",
         loss_weight: float = 0.08,
+        spectrogram_masking: bool = False,
+        spectrogram_input_dim: int = 80,
+        spectrogram_patch_size: Sequence[int] = (16, 16),
+        spectrogram_mask_ratio: float = 0.75,
+        spectrogram_mask_strategy: str = "curriculum",
+        spectrogram_curriculum_steps: int = 11500,
+        spectrogram_curriculum_c0: float = 0.01,
+        spectrogram_random_target_blocks: int = 4,
+        spectrogram_random_target_scale: Sequence[float] = (0.15, 0.20),
+        spectrogram_random_target_aspect: Sequence[float] = (0.75, 1.50),
+        spectrogram_tf_target_blocks: int = 3,
+        spectrogram_tf_target_scale: Sequence[float] = (0.05, 0.075),
+        spectrogram_mask_value: float = 0.0,
+        spectrogram_mask_seed: int = 0,
     ) -> None:
         super().__init__()
         if input_dim <= 0:
@@ -162,6 +176,7 @@ class LatentBridge(nn.Module):
         self.ema_decay = ema_decay
         self.loss_type = loss_type
         self.loss_weight = loss_weight
+        self.spectrogram_masking = bool(spectrogram_masking)
 
         self.online_encoder = _ResidualTransformerPath(
             feature_dim=input_dim,
@@ -186,6 +201,26 @@ class LatentBridge(nn.Module):
         )
         self.mask_token = nn.Parameter(torch.zeros(1, 1, input_dim))
         nn.init.normal_(self.mask_token, mean=0.0, std=0.02)
+        self.spectrogram_masker = None
+        if self.spectrogram_masking:
+            self.spectrogram_masker = AJEPASpectrogramMask(
+                input_dim=spectrogram_input_dim,
+                patch_size=spectrogram_patch_size,
+                mask_ratio=spectrogram_mask_ratio,
+                strategy=spectrogram_mask_strategy,
+                curriculum_steps=spectrogram_curriculum_steps,
+                curriculum_c0=spectrogram_curriculum_c0,
+                random_target_blocks=spectrogram_random_target_blocks,
+                random_target_scale=spectrogram_random_target_scale,
+                random_target_aspect=spectrogram_random_target_aspect,
+                tf_target_blocks=spectrogram_tf_target_blocks,
+                tf_target_scale=spectrogram_tf_target_scale,
+                mask_value=spectrogram_mask_value,
+                seed=spectrogram_mask_seed,
+            )
+            # The A-JEPA-inspired path masks the spectrogram view, so the
+            # legacy latent mask token is deliberately inactive.
+            self.mask_token.requires_grad_(False)
 
         self._last_loss: Optional[torch.Tensor] = None
         self._last_mask: Optional[torch.Tensor] = None
@@ -194,6 +229,38 @@ class LatentBridge(nn.Module):
     def output_size(self) -> int:
         """Return the unchanged ASR latent dimension."""
         return self.input_dim
+
+    @property
+    def uses_spectrogram_masking(self) -> bool:
+        """Whether training requires a second, structured Mel view."""
+        return self.spectrogram_masker is not None
+
+    def make_spectrogram_ssl_view(
+        self,
+        features: torch.Tensor,
+        feature_lengths: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Create the masked Mel view used only by the SSL branch."""
+        if self.spectrogram_masker is None:
+            raise RuntimeError("Spectrogram masking is not configured")
+        return self.spectrogram_masker(features, feature_lengths)
+
+    def project_spectrogram_mask_to_latent(
+        self,
+        patch_mask: torch.Tensor,
+        feature_time_steps: int,
+        latent_time_steps: int,
+        latent_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project time-frequency patch coverage onto ASR latent times."""
+        if self.spectrogram_masker is None:
+            raise RuntimeError("Spectrogram masking is not configured")
+        return self.spectrogram_masker.project_to_latent(
+            patch_mask,
+            feature_time_steps,
+            latent_time_steps,
+            latent_lengths,
+        )
 
     def train(self, mode: bool = True):
         """Set module mode while keeping the EMA target deterministic."""
@@ -205,6 +272,8 @@ class LatentBridge(nn.Module):
         self,
         base_features: torch.Tensor,
         feature_lengths: torch.Tensor,
+        ssl_features: Optional[torch.Tensor] = None,
+        ssl_target_weights: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Transform enhanced ASR latents and retain their time layout."""
         self._validate_inputs(base_features, feature_lengths)
@@ -238,6 +307,21 @@ class LatentBridge(nn.Module):
                 ),
             }
             return context, feature_lengths
+
+        if self.spectrogram_masker is not None:
+            return self._forward_spectrogram_ssl(
+                base_features,
+                feature_lengths,
+                valid_mask,
+                padding_mask,
+                ssl_features,
+                ssl_target_weights,
+            )
+
+        if ssl_features is not None or ssl_target_weights is not None:
+            raise ValueError(
+                "ssl_features/ssl_target_weights require spectrogram masking"
+            )
 
         mask = self._make_training_mask(valid_mask)
         mask_token = self.mask_token.to(dtype=base_features.dtype)
@@ -289,6 +373,91 @@ class LatentBridge(nn.Module):
         }
         return hybrid, feature_lengths
 
+    def _forward_spectrogram_ssl(
+        self,
+        base_features: torch.Tensor,
+        feature_lengths: torch.Tensor,
+        valid_mask: torch.Tensor,
+        padding_mask: torch.Tensor,
+        ssl_features: Optional[torch.Tensor],
+        ssl_target_weights: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Optimize a masked SSL view but return an unmasked ASR view."""
+        if ssl_features is None or ssl_target_weights is None:
+            raise ValueError(
+                "A-JEPA-inspired training requires ssl_features and "
+                "ssl_target_weights"
+            )
+        self._validate_inputs(ssl_features, feature_lengths)
+        if ssl_features.shape != base_features.shape:
+            raise ValueError("ssl_features must match base_features shape")
+        if ssl_target_weights.shape != valid_mask.shape:
+            raise ValueError(
+                "ssl_target_weights must have shape (batch, latent_time)"
+            )
+
+        # This branch is the representation contract used by both train and
+        # test.  It is intentionally independent of the sampled SSL mask.
+        asr_context = self.online_encoder(base_features, padding_mask)
+        asr_context = torch.where(
+            valid_mask.unsqueeze(-1), asr_context, base_features
+        )
+
+        ssl_context = self.online_encoder(ssl_features, padding_mask)
+        predicted = self.predictor(ssl_context, padding_mask)
+        with torch.no_grad():
+            target = self.target_encoder(base_features.detach(), padding_mask)
+
+        weights = ssl_target_weights.float() * valid_mask.float()
+        weight_sum = weights.sum()
+        if float(weight_sum.detach().item()) <= 0.0:
+            raise RuntimeError("A-JEPA-inspired latent target mask is empty")
+        prediction_float = predicted.float()
+        target_float = target.float()
+        if self.loss_type == "cosine":
+            token_loss = 1.0 - F.cosine_similarity(
+                prediction_float,
+                target_float,
+                dim=-1,
+                eps=1.0e-8,
+            )
+        else:
+            token_loss = F.smooth_l1_loss(
+                prediction_float,
+                target_float,
+                reduction="none",
+            ).mean(dim=-1)
+        latent_loss = (token_loss * weights).sum() / weight_sum
+
+        delta_rms, delta_relative = self._feature_delta_stats(
+            base_features,
+            asr_context,
+            valid_mask,
+        )
+        ssl_delta_rms, ssl_delta_relative = self._feature_delta_stats(
+            base_features,
+            ssl_features,
+            valid_mask,
+        )
+        valid_count = valid_mask.sum().clamp_min(1).float()
+        self._last_loss = latent_loss
+        self._last_mask = (weights > 0.0).detach()
+        self._last_stats = {
+            "loss_latent_bridge": latent_loss.detach(),
+            "latent_bridge_mask_ratio": (
+                weights.sum() / valid_count
+            ).detach(),
+            "latent_bridge_feature_delta_rms": delta_rms.detach(),
+            "latent_bridge_feature_delta_relative": delta_relative.detach(),
+            "latent_bridge_ssl_input_delta_rms": ssl_delta_rms.detach(),
+            "latent_bridge_ssl_input_delta_relative": (
+                ssl_delta_relative.detach()
+            ),
+        }
+        if self.spectrogram_masker is not None:
+            self._last_stats.update(self.spectrogram_masker.get_stats())
+        return asr_context, feature_lengths
+
     def compute_loss(self) -> Optional[torch.Tensor]:
         """Return the current differentiable masked latent loss, if any."""
         return self._last_loss
@@ -320,6 +489,8 @@ class LatentBridge(nn.Module):
             else:
                 target_buffer.copy_(online_buffer)
         self.target_encoder.eval()
+        if self.spectrogram_masker is not None:
+            self.spectrogram_masker.advance_step()
 
     def _validate_inputs(
         self,

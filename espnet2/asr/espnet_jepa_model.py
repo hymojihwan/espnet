@@ -609,9 +609,62 @@ class ESPnetJEPAASRModel(ESPnetASRModel):
                 positional_state = None
 
             latent_lengths = encoder_masks.squeeze(1).sum(1)
+            latent_bridge_kwargs = {}
+            if (
+                self.training
+                and self.latent_bridge is not None
+                and self.latent_bridge.uses_spectrogram_masking
+            ):
+                # Keep the ASR representation unmasked, and use a separate
+                # A-JEPA-inspired 16x16 Mel view only for self-supervision.
+                ssl_feats, ssl_patch_mask = (
+                    self.latent_bridge.make_spectrogram_ssl_view(
+                        feats,
+                        feats_lengths,
+                    )
+                )
+                ssl_embedded, ssl_encoder_masks = (
+                    self.encoder.forward_embedding(
+                        ssl_feats,
+                        feats_lengths,
+                    )
+                )
+                if ssl_encoder_masks is None:
+                    raise RuntimeError(
+                        "The A-JEPA-inspired SSL view requires an encoder "
+                        "padding mask"
+                    )
+                if not torch.equal(ssl_encoder_masks, encoder_masks):
+                    raise RuntimeError(
+                        "Masked and unmasked encoder embeddings must preserve "
+                        "the same time mask"
+                    )
+                if isinstance(ssl_embedded, tuple):
+                    ssl_latent = ssl_embedded[0]
+                else:
+                    ssl_latent = ssl_embedded
+                if ssl_latent.shape != base_latent.shape:
+                    raise RuntimeError(
+                        "Masked and unmasked encoder embeddings must have "
+                        "matching shapes"
+                    )
+                ssl_target_weights = (
+                    self.latent_bridge.project_spectrogram_mask_to_latent(
+                        ssl_patch_mask,
+                        feature_time_steps=feats.size(1),
+                        latent_time_steps=base_latent.size(1),
+                        latent_lengths=latent_lengths,
+                    )
+                )
+                latent_bridge_kwargs = {
+                    "ssl_features": ssl_latent,
+                    "ssl_target_weights": ssl_target_weights,
+                }
+
             aligned_latent, aligned_lengths = latent_bridge_module(
                 base_latent,
                 latent_lengths,
+                **latent_bridge_kwargs,
             )
             if not torch.equal(aligned_lengths, latent_lengths):
                 raise RuntimeError(

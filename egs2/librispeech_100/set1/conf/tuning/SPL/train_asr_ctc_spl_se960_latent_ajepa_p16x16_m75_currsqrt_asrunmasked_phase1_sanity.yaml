@@ -1,0 +1,99 @@
+# Four-iteration plumbing check for the A-JEPA-inspired two-view path.
+batch_type: numel
+batch_bins: 4800000
+valid_batch_bins: 19200000
+accum_grad: 1
+max_epoch: 1
+patience: none
+num_iters_per_epoch: 4
+init: none
+num_att_plot: 0
+log_interval: 1
+unused_parameters: false
+save_strategy: all
+
+freeze_param:
+    - frontend
+
+model: jepa_espnet
+model_conf:
+    ctc_weight: 1.0
+    lsm_weight: 0.1
+    length_normalized_loss: false
+    latent_bridge_conf:
+        context_layers: 1
+        context_heads: 4
+        context_ff_dim: 512
+        predictor_layers: 1
+        predictor_heads: 4
+        predictor_ff_dim: 512
+        dropout_rate: 0.1
+        ema_decay: 0.999
+        loss_type: cosine
+        loss_weight: 0.08
+        spectrogram_masking: true
+        spectrogram_input_dim: 80
+        spectrogram_patch_size: [16, 16]
+        spectrogram_mask_ratio: 0.75
+        spectrogram_mask_strategy: curriculum
+        spectrogram_curriculum_steps: 4
+        spectrogram_curriculum_c0: 0.01
+        spectrogram_random_target_blocks: 4
+        spectrogram_random_target_scale: [0.15, 0.20]
+        spectrogram_random_target_aspect: [0.75, 1.50]
+        spectrogram_tf_target_blocks: 3
+        spectrogram_tf_target_scale: [0.05, 0.075]
+        spectrogram_mask_value: 0.0
+        spectrogram_mask_seed: 0
+
+frontend: frozen_enh
+frontend_conf:
+    enh_train_config: exp/enh_train_enh_convtasnet_small_librispeech960_raw/config.yaml
+    enh_model_file: exp/enh_train_enh_convtasnet_small_librispeech960_raw/valid.loss.best.pth
+    enh_no_grad: true
+    fs: 16000
+    n_fft: 512
+    win_length: 400
+    hop_length: 160
+    n_mels: 80
+
+normalize: utterance_mvn
+normalize_conf: {}
+
+encoder: conformer
+encoder_conf:
+    output_size: 256
+    attention_heads: 4
+    linear_units: 1024
+    num_blocks: 12
+    dropout_rate: 0.1
+    positional_dropout_rate: 0.1
+    attention_dropout_rate: 0.1
+    input_layer: conv2d
+    normalize_before: true
+    macaron_style: true
+    rel_pos_type: latest
+    pos_enc_layer_type: rel_pos
+    selfattention_layer_type: rel_selfattn
+    activation_type: swish
+    use_cnn_module: true
+    cnn_module_kernel: 31
+
+decoder: null
+
+optim: adam
+optim_conf:
+    lr: 0.0002
+    weight_decay: 0.000001
+scheduler: warmuplr
+scheduler_conf:
+    warmup_steps: 5000
+
+specaug: null
+use_amp: true
+cudnn_deterministic: false
+cudnn_benchmark: false
+
+best_model_criterion:
+    - [valid, cer_ctc, min]
+keep_nbest_models: 1
